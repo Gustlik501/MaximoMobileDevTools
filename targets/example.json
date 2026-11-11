@@ -1,0 +1,11 @@
+{
+  "description": "copy to targets/<name>.json and fill in",
+  "protocol": "https",
+  "domain": "masdev.manage.example.com",
+  "port": "443",
+  "context": "maximo",
+  "workspaceid": "masdev",
+  "routingMode": "subdomain",
+  "apikey": "",
+  "insecure": false
+}

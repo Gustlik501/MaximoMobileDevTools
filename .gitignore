@@ -1,0 +1,16 @@
+# Environment data: recreated by `mdt init`, never committed.
+/mdt.json
+/images/*
+!/images/README.md
+/apps/*
+!/apps/README.md
+/framework/
+/out/
+/dist/
+/.mdt/
+/targets/*
+!/targets/example.json
+!/targets/README.md
+
+.DS_Store
+Thumbs.db
