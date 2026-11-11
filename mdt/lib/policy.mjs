@@ -157,53 +157,212 @@ const PROTECTED = ['AGENTS.md', 'AGENTS.local.md', '.claude/settings.json', '.cl
   f => `${ROOT_N}/${f.toLowerCase()}`
 );
 
+/** every category a path touches: the file, a protected folder itself, or a parent of one */
+export function classifyPathAll(file, cwd = ROOT) {
+  if (!file || typeof file !== 'string') return [];
+  file = file.replace(/^\/([a-z])\//i, '$1:/'); // Git Bash /c/Users -> c:/Users
+  const p = norm(path.isAbsolute(file) ? file : path.join(cwd, file)).replace(/\/+$/, '');
+  if (PROTECTED.includes(p)) return ['policy-change'];
+  const within = base => p === `${ROOT_N}/${base}` || p.startsWith(`${ROOT_N}/${base}/`);
+  if (within('framework/ootb') || p === `${ROOT_N}/framework/ootb.json` || within('mobileapps/ootb')) return ['ootb-write'];
+  if (within('framework/customized')) return ['framework-write'];
+  if (within('mobileapps/customized')) return ['apps-write'];
+  if (p === `${ROOT_N}/framework`) return ['ootb-write', 'framework-write'];
+  if (p === `${ROOT_N}/mobileapps`) return ['ootb-write', 'apps-write'];
+  return [];
+}
+
 export function classifyPath(file, cwd = ROOT) {
-  if (!file) return null;
-  const p = norm(path.isAbsolute(file) ? file : path.join(cwd, file));
-  if (PROTECTED.includes(p)) return 'policy-change';
-  if (p.startsWith(`${ROOT_N}/framework/ootb/`) || p === `${ROOT_N}/framework/ootb.json` || p.startsWith(`${ROOT_N}/mobileapps/ootb/`)) return 'ootb-write';
-  if (p.startsWith(`${ROOT_N}/framework/customized/`)) return 'framework-write';
-  if (p.startsWith(`${ROOT_N}/mobileapps/customized/`)) return 'apps-write';
+  return classifyPathAll(file, cwd)[0] || null;
+}
+
+// ---------------------------------------------------------------- shell commands
+// Only real writes count: reading (cat, grep, diff, ls, Get-Content, ...) is never
+// gated, whatever the policy. A path is "written" when it is a redirect target or
+// an argument of a command that writes (for copies: the destination only).
+
+/** Split a command line into segments of tokens. Quotes are respected; `>`/`>>` become {redirect} markers. */
+export function parseShell(cmd) {
+  const segs = [];
+  let tokens = [];
+  let cur = '';
+  let has = false;
+  let q = null;
+  const push = () => {
+    if (has) tokens.push(cur);
+    cur = '';
+    has = false;
+  };
+  const end = () => {
+    push();
+    if (tokens.length) segs.push(tokens);
+    tokens = [];
+  };
+  const s = String(cmd);
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (q) {
+      if (ch === q) q = null;
+      else cur += ch;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      q = ch;
+      has = true;
+    } else if (ch === '\n' || ch === ';') end();
+    else if (/\s/.test(ch)) push();
+    else if (ch === '&' && s[i + 1] === '&') {
+      end();
+      i++;
+    } else if (ch === '|') {
+      if (s[i + 1] === '|') i++;
+      end();
+    } else if (ch === '>') {
+      if (/^(\d+|&|\*)$/.test(cur)) {
+        cur = ''; // 2> &> *>
+        has = false;
+      } else push();
+      if (s[i + 1] === '>') i++;
+      if (s[i + 1] === '&') {
+        i++; // 2>&1, >&2: duplicates a stream, writes no file
+        while (/[\d-]/.test(s[i + 1] || '')) i++;
+      } else tokens.push({redirect: true});
+    } else if (ch === '<') push();
+    else {
+      cur += ch;
+      has = true;
+    }
+  }
+  end();
+  return segs;
+}
+
+const NULL_TARGETS = /^(\/dev\/null|\$null|nul|null)$/i;
+const PREFIXES = new Set(['sudo', 'command', 'time', 'nohup', 'env', 'exec', '&', 'call', 'start']);
+const CD = new Set(['cd', 'pushd', 'set-location', 'sl', 'chdir']);
+const WRITES_ALL_ARGS = new Set([
+  'rm', 'rmdir', 'mkdir', 'touch', 'truncate', 'chmod', 'chown', 'tee', 'patch', 'del', 'erase', 'rd', 'md', 'unlink', 'shred',
+  'mv', 'move', 'ren', 'rename', 'remove-item', 'ri', 'new-item', 'ni', 'set-content', 'sc', 'add-content', 'ac', 'clear-content',
+  'clc', 'out-file', 'move-item', 'mi', 'rename-item', 'rni'
+]);
+const WRITES_DEST = new Set(['cp', 'copy', 'copy-item', 'cpi', 'install', 'rsync', 'ln', 'xcopy', 'robocopy', 'scp']);
+const GIT_WRITES = new Set(['apply', 'checkout', 'restore', 'rm', 'mv', 'clean', 'stash', 'reset', 'am', 'merge', 'pull', 'cherry-pick', 'revert', 'rebase', 'switch']);
+const SHELLS = new Set(['bash', 'sh', 'zsh', 'cmd', 'powershell', 'pwsh']);
+const SCRIPTS = new Set(['node', 'python', 'python3', 'py', 'perl', 'ruby', 'deno', 'bun']);
+const SCRIPT_WRITE = /writeFile|appendFile|rmSync|rmdirSync|unlinkSync|renameSync|cpSync|copyFileSync|mkdirSync|createWriteStream|open\([^)]*['"][wax+]|write_text|write_bytes|shutil\.|os\.(remove|rename|unlink|makedirs)|Set-Content|Out-File|Remove-Item|Copy-Item|Move-Item/;
+
+const ADB_READ = /^adb\s+(-s\s+\S+\s+)?(devices|version|get-state|get-serialno|logcat\s+-d|forward\s+--list|exec-out\s+screencap|shell\s+(getprop|dumpsys|pm\s+list|pidof|cat\s+\/proc|wm\s+size|ps))/i;
+
+const cmdName = t => path.basename(String(t).replace(/\\/g, '/')).toLowerCase().replace(/\.exe$/, '');
+const isStr = t => typeof t === 'string';
+
+/** {cmd, args, redirects} of one segment (leading env assignments and sudo-like prefixes skipped). */
+function commandOf(tokens) {
+  const redirects = [];
+  const words = [];
+  for (let i = 0; i < tokens.length; i++) {
+    if (!isStr(tokens[i])) {
+      if (isStr(tokens[i + 1])) redirects.push(tokens[++i]);
+      continue;
+    }
+    words.push(tokens[i]);
+  }
+  let k = 0;
+  while (k < words.length && (/^[A-Za-z_][A-Za-z0-9_]*=/.test(words[k]) || PREFIXES.has(cmdName(words[k])))) k++;
+  return {cmd: words[k] ? cmdName(words[k]) : '', raw: words[k] || '', args: words.slice(k + 1), redirects};
+}
+
+/** Paths a segment writes to (null = it writes, but the targets are unknown, e.g. via xargs). */
+function writtenPaths({cmd, args}) {
+  const pos = args.filter(a => !a.startsWith('-'));
+  if (cmd === 'xargs') {
+    // targets come from stdin: unknown
+    const inner = cmdName(args.find(a => !a.startsWith('-')) || '');
+    const writes = WRITES_ALL_ARGS.has(inner) || WRITES_DEST.has(inner) || ((inner === 'sed' || inner === 'perl') && args.some(a => /^-[a-z]*i/i.test(a)));
+    return writes ? null : [];
+  }
+  if (WRITES_ALL_ARGS.has(cmd)) return pos;
+  if (WRITES_DEST.has(cmd)) return pos.slice(-1);
+  if ((cmd === 'sed' || cmd === 'perl') && args.some(a => /^-[a-z]*i/i.test(a) || a === '--in-place')) return pos;
+  if (cmd === 'git' && GIT_WRITES.has(args.find(a => !a.startsWith('-')))) return pos.slice(1);
+  if (cmd === 'find' && args.some(a => a === '-delete' || a === '-exec' || a === '-execdir')) {
+    const execAt = args.findIndex(a => a === '-exec' || a === '-execdir');
+    const writes = args.includes('-delete') || (execAt >= 0 && (WRITES_ALL_ARGS.has(cmdName(args[execAt + 1])) || WRITES_DEST.has(cmdName(args[execAt + 1])) || cmdName(args[execAt + 1]) === 'sed'));
+    return writes ? args.slice(0, args.findIndex(a => a.startsWith('-')) < 0 ? args.length : args.findIndex(a => a.startsWith('-'))) : [];
+  }
+  if (cmd === 'tar' && args.some(a => /^-?[a-z]*x/.test(a) || a === '--extract')) {
+    const c = args.findIndex(a => a === '-C' || a === '--directory');
+    return [c >= 0 ? args[c + 1] : '.'];
+  }
+  if (cmd === 'unzip' || cmd === 'expand-archive') {
+    const d = args.findIndex(a => a === '-d' || /^-destinationpath$/i.test(a));
+    return [d >= 0 ? args[d + 1] : '.'];
+  }
+  if (cmd === 'curl' || cmd === 'wget' || cmd === 'invoke-webrequest' || cmd === 'iwr') {
+    const o = args.findIndex(a => a === '-o' || a === '-O' || a === '--output' || /^-outfile$/i.test(a));
+    return o >= 0 ? [args[o + 1]] : [];
+  }
+  if (cmd === 'dd') return args.filter(a => a.startsWith('of=')).map(a => a.slice(3));
+  return [];
+}
+
+function mdtArgsOf({cmd, args}) {
+  if (cmd === 'mdt' || cmd === 'mdt.cmd' || cmd === 'mdt.sh') return args;
+  if (cmd === 'node' && args[0] && /mdt\.mjs$/i.test(args[0])) return args.slice(1);
   return null;
 }
 
-// split a shell command line into simple segments
-const splitSegments = cmd => String(cmd).split(/&&|\|\||[;|\n]/).map(s => s.trim()).filter(Boolean);
-const SHELL_META = /[;&|`<>\n]|\$\(/;
-
-const WRITE_VERB =
-  /(^|[\s(])(sed\s+(-[a-z]*i|--in-place)|perl\s+-[a-z]*i|tee|cp|mv|rm|rmdir|mkdir|touch|truncate|install|ln|unzip|tar\s+-?[a-z]*x|git\s+(apply|checkout|restore|stash|reset|clean|am|mv|rm)|patch|set-content|add-content|out-file|new-item|remove-item|copy-item|move-item|rename-item|clear-content|del|erase|copy|move|ren|writefile\w*|appendfile\w*|rmsync|unlinksync)\b|>/i;
-
-const ADB_READ = /\badb(\.exe)?["']?\s+(-s\s+\S+\s+)?(devices|version|get-state|get-serialno|logcat\s+-d|forward\s+--list|exec-out\s+screencap|shell\s+(getprop|dumpsys|pm\s+list|pidof|cat\s+\/proc|wm\s+size|ps))/i;
-
-function mdtArgs(segment) {
-  const m = segment.match(/(?:^|[\s"'\\/])(?:mdt(?:\.cmd|\.sh)?|mdt\.mjs)["']?\s+(.*)$/i);
-  if (!m) return null;
-  return m[1].split(/\s+/).filter(Boolean).map(a => a.replace(/^["']|["']$/g, ''));
-}
-
 /** Categories found in a shell command, plus whether it is one simple mdt call. */
-export function classifyCommand(cmd) {
+export function classifyCommand(cmdline, cwd = ROOT, depth = 0) {
   const classes = new Set();
-  const segs = splitSegments(cmd);
-  for (const seg of segs) {
-    const args = mdtArgs(seg);
-    if (args) {
-      const cls = classifyMdt(args);
+  const text = String(cmdline);
+  // command substitutions run too: classify them as well
+  const subs = [...text.matchAll(/\$\(([^()]*)\)|`([^`]*)`/g)].map(m => m[1] ?? m[2]);
+  const segs = parseShell(text);
+  let dir = cwd;
+  const addPath = p => {
+    for (const c of classifyPathAll(p, dir)) classes.add(c);
+  };
+  for (const tokens of segs) {
+    const seg = commandOf(tokens);
+    for (const r of seg.redirects) if (!NULL_TARGETS.test(r)) addPath(r);
+    if (!seg.cmd) continue;
+    if (CD.has(seg.cmd)) {
+      const to = seg.args.find(a => !a.startsWith('-'));
+      if (to) dir = path.resolve(dir, to);
+      continue;
+    }
+    const margs = mdtArgsOf(seg);
+    if (margs) {
+      const cls = classifyMdt(margs);
       if (cls) classes.add(cls);
       continue;
     }
-    if (/\badb(\.exe)?["']?\s/i.test(seg) && !ADB_READ.test(seg)) classes.add('adb-write');
-    if (/\b(podman|docker|skopeo)(\.exe)?\s+(push|copy)\b/i.test(seg)) classes.add('registry-push');
-    if (WRITE_VERB.test(seg)) {
-      const s = seg.replace(/\\/g, '/').toLowerCase();
-      if (/(^|[\s"'/=])(framework\/ootb|mobileapps\/ootb|framework\/ootb\.json)/.test(s)) classes.add('ootb-write');
-      if (/(^|[\s"'/=])framework\/customized\//.test(s)) classes.add('framework-write');
-      if (/(^|[\s"'/=])mobileapps\/customized\//.test(s)) classes.add('apps-write');
-      if (/agents(\.local)?\.md|\.claude\/settings|policy-hook\.mjs|lib\/policy\.mjs/.test(s)) classes.add('policy-change');
+    if (seg.cmd === 'adb') {
+      if (!ADB_READ.test(`adb ${seg.args.join(' ')}`)) classes.add('adb-write');
+      continue;
     }
+    if (['podman', 'docker', 'skopeo'].includes(seg.cmd) && ['push', 'copy'].includes(seg.args.find(a => !a.startsWith('-')))) {
+      classes.add('registry-push');
+      continue;
+    }
+    if (SHELLS.has(seg.cmd) && depth < 3) {
+      const ci = seg.args.findIndex(a => /^(-c|\/c|-command|-c[a-z]*)$/i.test(a));
+      if (ci >= 0 && seg.args[ci + 1]) for (const c of classifyCommand(seg.args.slice(ci + 1).join(' '), dir, depth + 1).classes) classes.add(c);
+      continue;
+    }
+    if (SCRIPTS.has(seg.cmd)) {
+      // inline scripts: count as a write only if they use a write API on a protected path
+      if (seg.args.some(a => SCRIPT_WRITE.test(a))) for (const a of seg.args) for (const m of a.match(/[\w./\\:-]+/g) || []) addPath(m);
+      continue;
+    }
+    const w = writtenPaths(seg);
+    if (w === null) for (const t of segs.flat().filter(isStr)) addPath(t);
+    else for (const p of w) if (p) addPath(p);
   }
-  const simpleMdt = segs.length === 1 && !!mdtArgs(segs[0]) && !SHELL_META.test(String(cmd));
+  for (const s of subs) if (depth < 3) for (const c of classifyCommand(s, dir, depth + 1).classes) classes.add(c);
+  const only = segs.length === 1 ? commandOf(segs[0]) : null;
+  const simpleMdt = !!only && !!mdtArgsOf(only) && !only.redirects.length && !subs.length;
   return {classes: [...classes], simpleMdt};
 }
 
@@ -219,7 +378,7 @@ export function decideToolCall(toolName, input, policy) {
     if (c) classes = [c];
     simple = true;
   } else if (/^(Bash|PowerShell)$/.test(toolName)) {
-    const r = classifyCommand(input.command || '');
+    const r = classifyCommand(input.command || '', input.cwd || ROOT);
     classes = r.classes;
     simple = r.simpleMdt;
   }

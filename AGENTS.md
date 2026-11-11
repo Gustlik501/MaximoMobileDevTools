@@ -29,6 +29,10 @@ uploads: ask        # never | ask                    mdt upload / publish, pushi
 | `auto` | go ahead without asking, then report what you did |
 | `never` | not allowed; tell the user what they would have to do themselves |
 
+**Reading files is never restricted.** `read-only` means "no changes": read, grep,
+diff and compare anything (OOTB, CUSTOMIZED, framework, apps) without asking.
+Only `device: off` also stops *reading the device*.
+
 Always free: reading files, `mdt build`, `mdt package`, `mdt diff`, `mdt status`, dry
 runs (`--dry-run`, incl. `mdt upgrade --dry-run`). `mdt upgrade` writes CUSTOMIZED and
 follows `framework`/`apps`. Changing OOTB, this policy, `.claude/settings*.json` or the
