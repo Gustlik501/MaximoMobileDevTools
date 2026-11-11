@@ -130,8 +130,13 @@ interoperate with IBM's ES5 classes).
 - `<v>` is the raw app.xml version (`9.2.71.0`), which also names the zip.
 - `upload-app --skip-zip` doesn't work: its argument check only looks at the first
   CLI argument, so it always re-packages. `mdt upload` sends the packaged zip itself.
-- The Configuration app's own upload accepts single source files or `<app>.zip`
-  containing `<app>/...` (the project). It replaces files in its workspace copy; the
+- The Configuration app's own upload accepts single source files or `<APP>.zip`
+  containing `<APP>/...` (the project; the name must equal the pod's app name, the
+  upper-case app id as in its downloads: `TECHMOBILE.zip`). It unzips into
+  `<workspace>/<user>/temp-upload/`. If a previous upload left that folder undeletable
+  (restrictive folder permissions in the zip), every later zip upload fails with "Could not
+  remove temp-upload directory after multiple attempts". Renaming the folder from the pod
+  terminal clears it. mdt builds this zip with normal permissions and no owner ids (`zip -X`). It replaces files in its workspace copy; the
   pod then builds with **its** framework.
 
 ## Upgrades: OOTB / CUSTOMIZED merge

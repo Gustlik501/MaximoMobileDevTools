@@ -297,14 +297,15 @@ function cmdPackage(cfg, appRef, opt) {
   const dir = path.join(P.dist, app.id, `${meta.version}-${stamp()}`);
   fs.mkdirSync(dir, {recursive: true});
   const artifacts = {};
-  for (const f of [meta.zip, `${meta.appId}.zip`, 'app-source.zip']) {
+  const cfgZip = meta.configZip || `${meta.appId.toUpperCase()}.zip`;
+  for (const f of [meta.zip, cfgZip, 'app-source.zip']) {
     fs.copyFileSync(path.join(out, f), path.join(dir, f));
     artifacts[f] = sha256File(path.join(dir, f));
   }
   fs.writeFileSync(path.join(dir, 'release.json'), JSON.stringify({...meta, artifacts, packagedAt: new Date().toISOString()}, null, 1));
   console.log(`\n${c.bold(rel(dir))}`);
   console.log(`  ${meta.zip.padEnd(34)} app binary for Maximo: mdt upload ${app.id} --target <name>`);
-  console.log(`  ${`${meta.appId}.zip`.padEnd(34)} sources for the MAS Configuration app (Upload), rebuilt there`);
+  console.log(`  ${cfgZip.padEnd(34)} sources for the MAS Configuration app (Upload), rebuilt there`);
   console.log(`  ${'app-source.zip'.padEnd(34)} raw source archive (the one inside the binary)`);
   console.log(`  ${'release.json'.padEnd(34)} versions, image, git commit, sha256`);
   console.log(`Test this exact build on the device: mdt push ${app.id} --release`);

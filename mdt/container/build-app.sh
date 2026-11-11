@@ -14,7 +14,7 @@
 # Output in /out:
 #   <app>__ver-<version>.zip   the app binary Maximo serves to devices
 #   app-source.zip             project sources (what is inside the binary)
-#   <app>.zip                  sources in the Configuration app upload layout (<app>/...)
+#   <APP>.zip                  sources in the Configuration app upload layout (<APP>/..., upper-case app id)
 #   www/                       the binary unpacked (what lands on the device)
 #   mdt-build.json, framework-report.json
 set -euo pipefail
@@ -94,8 +94,13 @@ cp "$ZIP" /out/
 # unpack inside the container first: a Windows-mounted /out refuses chmod/utime
 rm -rf /tmp/www && unzip -q -o -d /tmp/www "$ZIP" && cp -r /tmp/www/. /out/www/
 cp /tmp/www/app-source.zip /out/app-source.zip
-rm -rf /tmp/cfgzip && mkdir -p "/tmp/cfgzip/$APPID" && unzip -q -o -d "/tmp/cfgzip/$APPID" /tmp/www/app-source.zip
-(cd /tmp/cfgzip && zip -q -r "/tmp/$APPID.zip" "$APPID") && cp "/tmp/$APPID.zip" "/out/$APPID.zip"
+# The Configuration app's Upload wants <APPNAME>.zip containing <APPNAME>/... where
+# APPNAME is the upper-case app id (as it names its downloads: TECHMOBILE.zip).
+# Normal permissions and no stored owner ids (-X), so the pod can always clean up.
+CFG=$(echo "$APPID" | tr '[:lower:]' '[:upper:]')
+rm -rf /tmp/cfgzip && mkdir -p "/tmp/cfgzip/$CFG" && unzip -q -o -d "/tmp/cfgzip/$CFG" /tmp/www/app-source.zip
+find "/tmp/cfgzip/$CFG" -type d -exec chmod 755 {} + && find "/tmp/cfgzip/$CFG" -type f -exec chmod 644 {} +
+(cd /tmp/cfgzip && zip -q -r -X "/tmp/$CFG.zip" "$CFG") && cp "/tmp/$CFG.zip" "/out/$CFG.zip"
 
 node -e '
 const fs = require("fs");
@@ -103,11 +108,11 @@ const b = JSON.parse(fs.readFileSync("/tmp/www/build.json", "utf8"));
 let fw = null;
 try { fw = JSON.parse(fs.readFileSync("/out/framework-report.json", "utf8")); } catch (e) {}
 fs.writeFileSync("/out/mdt-build.json", JSON.stringify({
-  appId: process.argv[1], version: process.argv[2], zip: require("path").basename(process.argv[3]),
+  appId: process.argv[1], version: process.argv[2], zip: require("path").basename(process.argv[3]), configZip: process.argv[4],
   buildJsonVersion: b.version, debug: process.env.MDT_DEBUG === "1", builtAt: new Date().toISOString(),
   testHook: process.env.MDT_DEBUG === "1" && process.env.MDT_TEST_HOOK !== "0",
   appProcessorVersion: b.appProcessorVersion, buildToolsVersion: b.buildToolsVersion,
   framework: fw ? {changed: fw.changed, added: fw.added} : null
 }, null, 1));
-' "$APPID" "$APPVER" "$ZIP"
+' "$APPID" "$APPVER" "$ZIP" "$CFG.zip"
 log "done: $(basename "$ZIP")"

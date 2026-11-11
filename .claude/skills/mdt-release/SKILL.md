@@ -30,7 +30,7 @@ Never upload debug builds (mdt refuses).
 | file | use |
 |---|---|
 | `<app>__ver-<version>.zip` | app binary (Vite build + app-source.zip, framework compiled in). This is what `mdt upload` sends |
-| `<app>.zip` | sources in the MAS Configuration app's upload layout (`<app>/...`). Uploaded there, the **pod rebuilds with its own framework**: framework edits are lost unless the pod runs a patched image |
+| `<APP>.zip` (e.g. `TECHMOBILE.zip`) | sources in the MAS Configuration app's upload layout (`TECHMOBILE/...`; the pod requires the zip name to equal its upper-case app name). Uploaded there, the **pod rebuilds with its own framework**: framework edits are lost unless the pod runs a patched image |
 | `app-source.zip` | raw project archive, same as inside the binary |
 | `release.json` | app/version, image id + OOTB versions, customized framework files, git commit + dirty flag, sha256 of every artifact |
 

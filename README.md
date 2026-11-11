@@ -142,7 +142,7 @@ mdt also refuses blocked actions when run non-interactively.
 | file | what | how it gets to Maximo |
 |---|---|---|
 | `techmobile__ver-<v>.zip` | the app binary devices download, framework compiled in | `mdt upload techmobile --target uat` (or any REST client: `--dry-run` prints the request) |
-| `techmobile.zip` | sources in the MAS Configuration app's upload layout | Configuration app, Upload. The pod rebuilds it with **its** framework |
+| `TECHMOBILE.zip` | sources in the MAS Configuration app's upload layout (`TECHMOBILE/...`; the name must be the upper-case app id) | Configuration app, Upload. The pod rebuilds it with **its** framework |
 | `app-source.zip` | raw source archive (also inside the binary) | archive |
 | `release.json` | versions, image, commit, sha256 | |
 
