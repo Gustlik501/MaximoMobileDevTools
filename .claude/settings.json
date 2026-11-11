@@ -1,0 +1,20 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash|PowerShell",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node",
+            "args": [
+              "-e",
+              "import(require('url').pathToFileURL(require('path').join(process.env.CLAUDE_PROJECT_DIR || process.cwd(), 'mdt', 'agent', 'policy-hook.mjs')).href)"
+            ],
+            "timeout": 15
+          }
+        ]
+      }
+    ]
+  }
+}
