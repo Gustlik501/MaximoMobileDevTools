@@ -16,8 +16,9 @@
 
 ## Skills
 
-- `mdt-setup`: new clone / new image / new app, prerequisites, init problems
-- `mdt-framework`: finding and changing framework behavior, the patch, image upgrades
+- `mdt-setup`: new project from the template, OOTB/CUSTOMIZED imports, prerequisites
+- `mdt-upgrade`: new IBM release, three-way merge into CUSTOMIZED, resolving conflicts
+- `mdt-framework`: finding and changing framework behavior in Framework/CUSTOMIZED
 - `mdt-device`: build, push, reload, DevTools debugging, backup/restore
 - `mdt-test`: drive the app on the device to verify a change (tap, type, wait, state, console)
 - `mdt-release`: package, upload to Maximo, Configuration-app source zip, patched image

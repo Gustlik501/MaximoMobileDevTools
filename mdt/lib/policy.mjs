@@ -15,8 +15,8 @@ export const LEVELS = {
   device: ['off', 'read-only', 'ask', 'auto'], // install/reload/restart on the device
   'device-ui': ['off', 'read-only', 'ask', 'auto'], // driving the app: tap, type, key, eval
   'device-data': ['ask', 'auto'], // saving/submitting/syncing records while driving (agent behavior)
-  framework: ['read-only', 'ask', 'auto'], // edits under framework/
-  apps: ['read-only', 'ask', 'auto'], // edits under apps/
+  framework: ['read-only', 'ask', 'auto'], // edits under Framework/CUSTOMIZED
+  apps: ['read-only', 'ask', 'auto'], // edits under MobileApps/CUSTOMIZED
   uploads: ['never', 'ask'] // mdt upload/publish, registry pushes
 };
 
@@ -90,7 +90,9 @@ const MDT_CLASSES = {
   key: 'device-ui',
   eval: 'device-ui',
   upload: 'upload',
-  publish: 'upload'
+  publish: 'upload',
+  ootb: 'ootb-write',
+  upgrade: 'upgrade'
 };
 
 /** Category of one mdt invocation: args = everything after `mdt`. */
@@ -100,7 +102,7 @@ export function classifyMdt(args) {
   if (sub === 'policy' && sub2 === 'set') return 'policy-change';
   if (sub === 'app' && sub2 === 'import') return 'device-read';
   if (sub === 'env' && sub2 === 'detect') return 'device-read';
-  if ((sub === 'framework' || sub === 'fw') && ['load', 'reset', 'apply', 'extract'].includes(sub2)) return 'framework-write';
+  if (sub === 'upgrade' && dry) return null;
   if (sub === 'console' && args.includes('--reload')) return 'device-write';
   const cls = MDT_CLASSES[sub];
   if (!cls) return null;
@@ -130,6 +132,14 @@ export function decide(policy, cls) {
       return how('uploads', {never: 'deny', ask: 'ask'});
     case 'policy-change':
       return {key: 'policy', level: 'user-only', decision: 'ask'};
+    case 'ootb-write':
+      return {key: 'ootb', level: 'pristine', decision: 'ask'};
+    case 'upgrade': {
+      // writes Framework/CUSTOMIZED and MobileApps/CUSTOMIZED
+      const f = decide(policy, 'framework-write');
+      const a = decide(policy, 'apps-write');
+      return RANK[f.decision] >= RANK[a.decision] ? f : a;
+    }
     case 'adb-write':
       return how('device', {off: 'deny', 'read-only': 'deny', ask: 'ask', auto: 'ask'});
     case 'registry-push':
@@ -151,8 +161,9 @@ export function classifyPath(file, cwd = ROOT) {
   if (!file) return null;
   const p = norm(path.isAbsolute(file) ? file : path.join(cwd, file));
   if (PROTECTED.includes(p)) return 'policy-change';
-  if (p.startsWith(`${ROOT_N}/framework/`)) return 'framework-write';
-  if (p.startsWith(`${ROOT_N}/apps/`)) return 'apps-write';
+  if (p.startsWith(`${ROOT_N}/framework/ootb/`) || p === `${ROOT_N}/framework/ootb.json` || p.startsWith(`${ROOT_N}/mobileapps/ootb/`)) return 'ootb-write';
+  if (p.startsWith(`${ROOT_N}/framework/customized/`)) return 'framework-write';
+  if (p.startsWith(`${ROOT_N}/mobileapps/customized/`)) return 'apps-write';
   return null;
 }
 
@@ -186,8 +197,9 @@ export function classifyCommand(cmd) {
     if (/\b(podman|docker|skopeo)(\.exe)?\s+(push|copy)\b/i.test(seg)) classes.add('registry-push');
     if (WRITE_VERB.test(seg)) {
       const s = seg.replace(/\\/g, '/').toLowerCase();
-      if (/(^|[\s"'/=])framework\//.test(s) && !/\bmdt(\.cmd|\.sh)?\s+framework\b/.test(s)) classes.add('framework-write');
-      if (/(^|[\s"'/=])apps\//.test(s)) classes.add('apps-write');
+      if (/(^|[\s"'/=])(framework\/ootb|mobileapps\/ootb|framework\/ootb\.json)/.test(s)) classes.add('ootb-write');
+      if (/(^|[\s"'/=])framework\/customized\//.test(s)) classes.add('framework-write');
+      if (/(^|[\s"'/=])mobileapps\/customized\//.test(s)) classes.add('apps-write');
       if (/agents(\.local)?\.md|\.claude\/settings|policy-hook\.mjs|lib\/policy\.mjs/.test(s)) classes.add('policy-change');
     }
   }
@@ -226,8 +238,10 @@ export function decideToolCall(toolName, input, policy) {
     'device-write': 'installing/reloading on the device',
     'device-ui': 'driving the app UI on the device',
     'adb-write': 'a raw adb command that may change the device (use mdt instead)',
-    'framework-write': 'changing framework sources (framework/)',
-    'apps-write': 'changing app sources (apps/)',
+    'framework-write': 'changing framework sources (Framework/CUSTOMIZED)',
+    'apps-write': 'changing app sources (MobileApps/CUSTOMIZED)',
+    'ootb-write': "changing IBM's pristine sources (OOTB: only via mdt ootb during an upgrade)",
+    upgrade: 'merging a new IBM release into CUSTOMIZED',
     upload: 'uploading to a Maximo server',
     'registry-push': 'pushing an image to a registry',
     'policy-change': "changing the agent policy or its enforcement (user's call)"

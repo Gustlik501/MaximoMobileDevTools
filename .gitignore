@@ -1,10 +1,8 @@
-# Environment data: recreated by `mdt init`, never committed.
+# Local only: never committed.
+# (Framework/ and MobileApps/, OOTB and CUSTOMIZED, ARE committed: keep project repos private.)
 /mdt.json
 /images/*
 !/images/README.md
-/apps/*
-!/apps/README.md
-/framework/
 /out/
 /dist/
 /.mdt/
@@ -12,9 +10,13 @@
 !/targets/example.json
 !/targets/README.md
 
-.DS_Store
-Thumbs.db
-
 # per-clone agent policy and personal Claude Code settings
 /AGENTS.local.md
 /.claude/settings.local.json
+
+# build leftovers if someone runs tools inside an app folder
+node_modules/
+/MobileApps/*/*/build/
+
+.DS_Store
+Thumbs.db

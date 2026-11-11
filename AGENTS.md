@@ -16,8 +16,8 @@ either file; asking the user to change it is fine.
 device: ask         # off | read-only | ask | auto   push, deploy, restore, reload, restart on the device
 device-ui: ask      # off | read-only | ask | auto   driving the app: tap, type, key, eval
 device-data: ask    # ask | auto                     saving, submitting or syncing Maximo records while testing
-framework: ask      # read-only | ask | auto         editing framework sources (framework/)
-apps: auto          # read-only | ask | auto         editing app sources (apps/)
+framework: ask      # read-only | ask | auto         editing Framework/CUSTOMIZED
+apps: auto          # read-only | ask | auto         editing MobileApps/CUSTOMIZED
 uploads: ask        # never | ask                    mdt upload / publish, pushing images to a registry
 ```
 
@@ -29,8 +29,9 @@ uploads: ask        # never | ask                    mdt upload / publish, pushi
 | `auto` | go ahead without asking, then report what you did |
 | `never` | not allowed; tell the user what they would have to do themselves |
 
-Always free: reading files, `mdt build`, `mdt package`, `mdt framework status|diff|save`,
-dry runs (`--dry-run`). Changing this policy, `.claude/settings*.json` or the
+Always free: reading files, `mdt build`, `mdt package`, `mdt diff`, `mdt status`, dry
+runs (`--dry-run`, incl. `mdt upgrade --dry-run`). `mdt upgrade` writes CUSTOMIZED and
+follows `framework`/`apps`. Changing OOTB, this policy, `.claude/settings*.json` or the
 hook always needs the user's explicit approval.
 
 **Enforcement.** In Claude Code, `mdt/agent/policy-hook.mjs` (a PreToolUse hook in
@@ -58,12 +59,19 @@ server (UAT or prod data).
 
 ## Code rules
 
-- Framework edits only under `framework/<profile>/<package>/`, minimal, LF, IBM's
-  formatting. Then run `mdt framework save` (writes `patches/framework.patch`) and suggest
-  committing it. `framework: read-only` means suggest the change as a diff and don't
-  apply it.
-- App edits go in the app's own folder under `apps/` (usually its own git repo).
+- Layout: `Framework/OOTB` + `MobileApps/OOTB/<APP>` are IBM's pristine sources;
+  `Framework/CUSTOMIZED` + `MobileApps/CUSTOMIZED/<APP>` are the project's. Builds
+  use CUSTOMIZED.
+- **Never edit OOTB by hand.** It only changes through `mdt ootb framework|app` during a
+  Maximo update, followed by `mdt upgrade` (the `mdt-upgrade` skill).
+- Framework edits go in `Framework/CUSTOMIZED/<package>/`: minimal, LF, IBM's formatting
+  (keeps upgrades mergeable). With `framework: read-only`, show the change as a diff and
+  don't apply it.
+- `maximo-js-api` is also loaded in Node at build time (`build/commonjs`): no module-level
+  `window`/`document` access in framework code. Guard it with `typeof window !== 'undefined'`.
 - The framework is bundled into each app: rebuild every app that should get a change.
-- Never commit `images/`, `apps/`, `framework/`, `out/`, `dist/`, `.mdt/`,
-  `mdt.json`, `AGENTS.local.md`, `targets/*.json`. Never print target credentials.
+- `mdt diff` shows everything customized vs OOTB (`patches/*.patch`).
+- Never commit `images/`, `out/`, `dist/`, `.mdt/`, `mdt.json`, `AGENTS.local.md`,
+  `targets/*.json`. Never print target credentials. The repo contains IBM code: it
+  must stay private.
 - Uploads: `--dry-run` first, name the target environment, never a debug build.

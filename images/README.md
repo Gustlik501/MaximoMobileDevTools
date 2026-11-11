@@ -3,12 +3,13 @@
 Put the IBM `mas/graphite-configuration` image here as a `docker save` tar
 (the "graphite pod" image of the MAS environment), then run `mdt init`.
 
-- One tar = one **profile** (named after the image's `version` label, e.g. `2.5.15`).
-- When Maximo is updated, drop the new tar in here and run `mdt init` again: the
-  new profile gets its own framework sources and `patches/framework.patch` is
-  applied to it. Switch with `mdt image use <profile>`.
-- Tars are git-ignored (3.5 GB each). The tar is loaded into Podman once; after
-  that mdt only reads its manifest.
+- `mdt init` (first time) extracts `Framework/OOTB` from the newest tar here and
+  records it in `Framework/ootb.json`; builds use that image.
+- When Maximo is updated: copy the new tar in, `mdt ootb framework images/<new>.tar`,
+  then `mdt upgrade` (see the README, "Maximo update"). Old tars can go once the
+  upgrade is committed.
+- Tars are git-ignored (3.5 GB each). On another machine, copy the tar that
+  `Framework/ootb.json` names into `images/`; mdt loads it into Podman when needed.
 
 Getting the tar from a cluster: find the pod that runs `mas/graphite-configuration`,
 read its image reference, then pull and save it with a registry login that can read

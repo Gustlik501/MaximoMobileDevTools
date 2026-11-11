@@ -1,52 +1,52 @@
 ---
 name: mdt-setup
-description: Set up or refresh a MobileDevTools (mdt) workspace for Maximo Mobile - a fresh clone for a new environment, a new graphite-configuration image tar after a Maximo update, adding app sources (TECHMOBILE, NAVIGATOR, ...), checking prerequisites (Node, Podman, adb), or fixing `mdt init` / `mdt doctor` problems.
+description: Set up a Maximo Mobile project from the MobileDevTools template - new private repo, graphite-configuration image tar into images/, Framework/OOTB from the image, pristine app downloads into MobileApps/OOTB, the customized apps into MobileApps/CUSTOMIZED, build env, first commit. Also prerequisites (Node, Podman, adb) and `mdt init` / `mdt doctor` problems.
 ---
 
-# Setting up an mdt workspace
+# Setting up a project
 
-One clone = one Maximo environment. The user supplies the IBM image tar and the
-app sources; `mdt init` does the rest and is safe to re-run.
+One private repo per customer project, created from this template. It holds IBM's
+pristine sources (OOTB) next to the project's (CUSTOMIZED). The template itself has no
+IBM code; a project repo does, so it must be private.
 
 ## Steps
 
-1. `.\mdt.cmd doctor` (Git Bash: `./mdt.sh doctor`). Node >= 22, Podman ready,
-   git, curl are required; adb + device are only needed for device work.
-2. Image: the `mas/graphite-configuration` tar goes into `images/` (any name ending in
-   `.tar`). `images/README.md` shows how to pull it from a cluster.
-3. Apps: one folder per app in `apps/` (`apps/TECHMOBILE/src/app.xml` ...). Folders
-   elsewhere: `mdt app add <path>`. Sources of what's installed on the device:
-   `mdt app import <appId>` (read-only on the device).
-4. `.\mdt.cmd init`. It loads the tar into Podman (first time takes minutes for
-   ~3.5 GB), registers a profile named after the image version, extracts the
-   framework into `framework/<profile>/`, applies `patches/framework.patch`,
-   registers apps, and reads the `VITE_*` build env from the device.
-5. Check: `mdt status`, then `mdt build <app>` (release, ~30 s). Build output goes
-   to `out/<profile>/<app>/`.
+1. `.\mdt.cmd doctor` (Git Bash: `./mdt.sh doctor`). Needs Node >= 22, Podman, git,
+   curl; adb and a debuggable APK only for device work. The folder must be a git repo.
+2. **Framework.** Copy the environment's `mas/graphite-configuration` tar into `images/`
+   (`images/README.md` shows how to pull it), then run `mdt init`. It loads the image,
+   extracts `Framework/OOTB` (sources rebuilt from the image's source maps), copies it to
+   `Framework/CUSTOMIZED`, writes `Framework/ootb.json` (which image) and reads the
+   `VITE_*` build env from the device.
+3. **Apps.** For each app, the user downloads the **pristine** app from the MAS
+   Configuration app. Then run `mdt ootb app <download.zip> --as TECHMOBILE`, which
+   creates `MobileApps/OOTB/TECHMOBILE` and copies it to CUSTOMIZED.
+   - If mdt warns "not pristine?" (`*.delta.xml` files, or `src/` differs from
+     `ibm-config/src/`), ask the user before going on.
+   - An existing customized version replaces `MobileApps/CUSTOMIZED/<APP>`. The folder
+     name must match the OOTB one.
+   - Sources of what's deployed: `mdt app import <id>` (from the device, read-only)
+     puts them in CUSTOMIZED.
+4. `mdt status`, then `mdt diff` (what's customized vs OOTB) and `mdt build <app>`.
+5. Suggest the first commit: `git add -A && git commit -m "Baseline ..."`, then
+   `git tag ootb-<version>`. Upgrades use OOTB at the last commit as their merge base,
+   so OOTB must be committed before the next IBM release is dropped in.
 
-If no device is connected, ask the user for the MAS domain and set the build env:
+No device? Set the build env by hand:
 `mdt env set VITE_ROUTING_MODE=subdomain VITE_MAS_DOMAIN=<host> VITE_ROOT_PATH=`.
-These end up in the app's `process.env`; the MAS pod sets the same three.
-
-## New image (Maximo update)
-
-Put the new tar in `images/`, run `mdt init`. The new profile gets fresh framework
-sources with the patch applied. Rejected hunks show as `*.rej` in
-`mdt framework status`; hand over to the `mdt-framework` skill to resolve them.
-Then switch with `mdt image use <profile>`. Old profiles can be dropped with
-`mdt image remove <profile> --rmi` (refuses while it holds unsaved framework edits).
 
 ## Troubleshooting
 
 | symptom | fix |
 |---|---|
-| `podman not ready` | `podman machine start` (mdt tries once); no machine at all: `podman machine init` |
-| `image ... has no /graphite/node_modules/@maximo/maximo-js-api` | wrong tar, it isn't graphite-configuration |
-| profile name clash | two tars with the same version label: `mdt image add <tar> --name <name>` |
-| adb not found | set `"device": {"adb": "C:\\path\\adb.exe"}` in mdt.json, or put adb on PATH |
-| `run-as ... failed` / not debuggable | the APK must be a debuggable build; Play Store builds can't be used |
-| several devices | `--serial <id>` (see `adb devices`) |
-| app not discovered | the folder needs `src/app.xml` with `<maximo-application id=...>` or `<application id=...>` |
+| `podman not ready` | `podman machine start` (mdt tries once); none yet: `podman machine init` |
+| `no OOTB yet` | the tar isn't in `images/`, or isn't graphite-configuration |
+| `image ... is not loaded and no tar in images/ contains it` | the tar that `Framework/ootb.json` names is missing on this machine: copy it into `images/` |
+| `upgrade needs ... git repository` | `git init` + first commit |
+| adb not found | `"device": {"adb": "C:\\path\\adb.exe"}` in mdt.json, or put adb on PATH |
+| `run-as ... failed` | the APK must be a debuggable build |
+| several devices | `--serial <id>` |
+| app missing in `mdt status` | the folder needs `src/app.xml` (`<maximo-application id=...>` or `<application id=...>`) |
 | Docker instead of Podman | `"container": {"engine": "docker"}` in mdt.json |
 
-`mdt.json` is per clone and git-ignored; `mdt init` rebuilds most of it.
+`mdt.json` (device, build env, tar cache) is local and git-ignored.

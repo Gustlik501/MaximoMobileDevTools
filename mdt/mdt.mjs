@@ -8,30 +8,28 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import {spawnSync} from 'node:child_process';
-import * as fw from './lib/framework.mjs';
-import {checkEngine, containerRun, containerScript, engine, engineStatus, imageExists, imageIdFromTar, inspectImage, loadImage} from './lib/container.mjs';
+import * as proj from './lib/project.mjs';
+import {containerRun, containerScript, engine, engineStatus} from './lib/container.mjs';
 import {Device, backup, detectAdb, detectBuildEnv, printDevice, pushBundle, reload, restoreBackup} from './lib/device.mjs';
 import {describeTarget, loadTarget, uploadZip} from './lib/upload.mjs';
 import * as drive from './lib/drive.mjs';
 import {LEVELS, POLICY_FILES, classifyMdt, decide, loadPolicy, writeLocalPolicy} from './lib/policy.mjs';
 import {
   APP_ID_RE,
-  DEFAULT_PACKAGES,
   MdtError,
   P,
   ROOT,
   TOOL_DIR,
-  abs,
   appOf,
   c,
   capture,
   confirm,
   fail,
+  git,
   info,
+  listApps,
   loadCfg,
   ok,
-  profileOf,
-  readAppInfo,
   readJson,
   rel,
   run,
@@ -42,6 +40,12 @@ import {
   walk,
   warn
 } from './lib/util.mjs';
+
+const HOOK_HINT = 'Claude Code hook NOT installed: copy mdt/agent/claude-settings.json to .claude/settings.json (then commit it)';
+function hookInstalled() {
+  const f = path.join(ROOT, '.claude', 'settings.json');
+  return fs.existsSync(f) && fs.readFileSync(f, 'utf8').includes('policy-hook.mjs');
+}
 
 // ================================================================ setup
 
@@ -57,303 +61,98 @@ function doctor(cfg, {quiet = false} = {}) {
     es = engineStatus(cfg);
   }
   add(engine(cfg), es.ok, es.ok ? `ready (${es.arch})` : es.why);
-  const git = spawnSync('git', ['--version'], {encoding: 'utf8'});
-  add('git', git.status === 0, (git.stdout || 'missing').trim());
+  const g = spawnSync('git', ['--version'], {encoding: 'utf8'});
+  add('git', g.status === 0, (g.stdout || 'missing').trim());
+  add('repo', proj.isGitRepo(), proj.isGitRepo() ? 'git repository' : 'not a git repository (upgrades need one: git init)');
   const curl = spawnSync(process.platform === 'win32' ? path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'curl.exe') : 'curl', ['--version'], {encoding: 'utf8'});
   add('curl', curl.status === 0, (curl.stdout || 'missing').split('\n')[0].trim());
   const adb = (cfg.device.adb && fs.existsSync(cfg.device.adb) && cfg.device.adb) || detectAdb();
   add('adb', !!adb, adb || 'not found (only needed for device commands)');
   if (adb) {
-    const dev = new Device({...cfg, device: {...cfg.device, adb}});
-    const devs = dev.devices();
+    const devs = new Device({...cfg, device: {...cfg.device, adb}}).devices();
     add('device', devs.length > 0, devs.length ? devs.join(', ') : 'none connected');
   }
   add('policy', hookInstalled(), hookInstalled() ? 'Claude Code hook installed' : HOOK_HINT);
   if (!quiet) for (const r of rows) console.log(`  ${r.good ? c.green('ok ') : c.yellow('-- ')} ${r.name.padEnd(7)} ${r.detail}`);
   if (major < 22) fail('Node 22 or newer is required');
-  return {rows, adb, engineOk: es.ok};
+  return {adb, engineOk: es.ok};
 }
 
 async function cmdInit(cfg, {opt}) {
-  console.log(c.bold(`mdt workspace: ${ROOT}`));
+  console.log(c.bold(`mdt project: ${ROOT}`));
   const d = doctor(cfg);
-  for (const dir of [P.images, P.apps, P.patches, P.targets, path.join(ROOT, 'framework'), path.join(ROOT, 'out'), P.dist, P.state]) {
-    fs.mkdirSync(dir, {recursive: true});
-  }
+  for (const dir of [P.fwOotb, P.fwCust, P.appsOotb, P.appsCust, P.images, P.patches, P.targets, P.dist, P.state]) fs.mkdirSync(dir, {recursive: true});
   if (d.adb) cfg.device.adb = d.adb;
-  saveCfg(cfg);
 
-  // images/*.tar -> one profile each
-  if (!d.engineOk) warn('skipping images: container engine not ready');
-  else {
-    const tars = fs.readdirSync(P.images).filter(f => f.endsWith('.tar')).map(f => path.join(P.images, f));
-    if (!tars.length && !Object.keys(cfg.profiles).length) warn('no image yet: copy the graphite-configuration .tar into images/ and run mdt init again');
-    for (const t of tars) {
-      const known = Object.values(cfg.profiles).find(p => p.tar && abs(p.tar) === t);
-      if (known && imageExists(cfg, known.image)) continue;
-      imageAdd(cfg, {tar: t}, opt);
-    }
-    for (const [name, p] of Object.entries(cfg.profiles)) {
-      if (!fw.manifest(name) && imageExists(cfg, p.image)) setupFramework(cfg, profileOf(cfg, {profile: name}));
+  if (!d.engineOk) warn('container engine not ready: skipping the image');
+  else if (!proj.fwMeta()) {
+    if (proj.imageTars().length) proj.importFrameworkOotb(cfg, null, opt.packages ? {packages: String(opt.packages).split(',')} : {});
+    else warn('no image yet: copy the graphite-configuration .tar into images/ and run mdt init again');
+  } else {
+    try {
+      proj.ensureImage(cfg, proj.fwMeta().image);
+    } catch (e) {
+      warn(e.message);
     }
   }
 
-  // apps/* (and legacy top-level app folders)
-  for (const base of [P.apps, ROOT]) {
-    for (const e of fs.readdirSync(base, {withFileTypes: true})) {
-      if (!e.isDirectory() || e.name.startsWith('.') || ['mdt', 'framework', 'out', 'dist', 'images', 'apps', 'patches', 'targets', 'docs'].includes(e.name)) continue;
-      const dir = path.join(base, e.name);
-      const ai = readAppInfo(dir);
-      if (!ai?.id) continue;
-      const id = ai.id.toLowerCase();
-      if (!cfg.apps[id]) {
-        cfg.apps[id] = {src: rel(dir)};
-        info(`app ${c.bold(id)} ${ai.version || ''} -> ${rel(dir)}`);
-      }
-    }
-  }
-  for (const [id, a] of Object.entries(cfg.apps)) if (!fs.existsSync(abs(a.src))) warn(`app ${id}: ${a.src} no longer exists`);
-
-  // build env from the device, if one is connected (read-only)
   if (d.adb && !Object.keys(cfg.buildEnv).length) {
     try {
-      const dev = new Device(cfg, opt).ensure();
-      const det = detectBuildEnv(dev);
+      const det = detectBuildEnv(new Device(cfg, opt).ensure());
       if (det) {
         cfg.buildEnv = det.env;
         info(`build env from ${det.appId} on the device: ${Object.entries(det.env).map(([k, v]) => `${k}=${v}`).join(' ')}`);
       }
     } catch (e) {
-      info(`build env not detected from a device (${e.message.split('\n')[0]}); set it with mdt env set if needed`);
+      info(`build env not read from a device (${e.message.split('\n')[0]}); set it with mdt env set if needed`);
     }
   }
-
-  // active profile: the newest image unless one is chosen
-  const byDate = Object.entries(cfg.profiles).sort((a, b) => String(b[1].created || b[1].buildDate).localeCompare(String(a[1].created || a[1].buildDate)));
-  if (!cfg.activeProfile || !cfg.profiles[cfg.activeProfile]) cfg.activeProfile = byDate[0]?.[0] || null;
-  else if (byDate[0] && byDate[0][0] !== cfg.activeProfile) warn(`newer image registered: ${byDate[0][0]} (switch with: mdt image use ${byDate[0][0]})`);
   saveCfg(cfg);
-
   console.log('');
   cmdStatus(cfg);
 }
 
-function setupFramework(cfg, prof, packages = prof.packages || DEFAULT_PACKAGES, {force = false} = {}) {
-  const before = fw.manifest(prof.name) ? fw.patchState(prof.name) : 'none';
-  fw.extract(cfg, prof, packages, {force});
-  if (before === 'unsaved') {
-    warn('kept your unsaved framework edits; patches/framework.patch was not re-applied');
-  } else if (fs.existsSync(P.frameworkPatch) && fs.statSync(P.frameworkPatch).size) {
-    const r = fw.load(prof.name);
-    if (!r.ok) {
-      warn(`resolve the *.rej files under framework/${prof.name}, then run: mdt framework save`);
-    }
-  }
-}
-
-function imageAdd(cfg, {tar, id}, opt) {
-  checkEngine(cfg);
-  if (tar) {
-    if (!fs.existsSync(tar)) fail(`not found: ${tar}`);
-    info(`reading ${path.basename(tar)} ...`);
-    id = imageIdFromTar(tar);
-    if (id && imageExists(cfg, id)) info(`image ${id.slice(0, 12)} already loaded`);
-    else id = loadImage(cfg, tar) || fail(`could not tell which image ${tar} contains`);
-  }
-  const im = inspectImage(cfg, id);
-  const existing = Object.entries(cfg.profiles).find(([, p]) => p.image === im.fullId);
-  let name = opt.name || existing?.[0] || im.labels.version || im.fullId.slice(0, 12);
-  if (cfg.profiles[name] && cfg.profiles[name].image !== im.fullId) {
-    name = `${im.labels.version}-${im.labels.release}`;
-    if (cfg.profiles[name] && cfg.profiles[name].image !== im.fullId) fail(`profile name clash for ${tar || id}: pass --name`);
-  }
-  cfg.profiles[name] = {
-    ...(cfg.profiles[name] || {}),
-    tar: tar ? rel(tar) : cfg.profiles[name]?.tar || null,
-    image: im.fullId,
-    version: im.labels.version,
-    release: im.labels.release,
-    buildDate: im.labels['build-date'],
-    created: im.created,
-    tools: im.tools,
-    packages: cfg.profiles[name]?.packages || DEFAULT_PACKAGES
-  };
-  saveCfg(cfg);
-  ok(`profile ${c.bold(name)}: graphite-configuration ${im.labels.version}-${im.labels.release}, maximo-js-api ${im.tools['maximo-js-api']}, maxdev-cli ${im.tools['maxdev-cli']}`);
-  if (!opt['no-extract'] && !fw.manifest(name)) setupFramework(cfg, profileOf(cfg, {profile: name}));
-  return name;
-}
-
 function cmdStatus(cfg) {
-  console.log(c.bold('profiles (images)'));
-  if (!Object.keys(cfg.profiles).length) console.log('  none: put a graphite-configuration .tar into images/ and run mdt init');
-  for (const [name, p] of Object.entries(cfg.profiles)) {
-    const st = fw.manifest(name) ? fw.status(name) : null;
-    const edits = st ? `${fw.editCount(st)} framework edit(s), patch ${fw.patchState(name)}` : 'framework not extracted';
-    console.log(`  ${name === cfg.activeProfile ? c.green('*') : ' '} ${c.bold(name.padEnd(12))} ${p.image.slice(0, 12)}  js-api ${p.tools?.['maximo-js-api'] || '?'}  ${edits}`);
+  const meta = proj.fwMeta();
+  console.log(c.bold('Framework'));
+  if (!meta) console.log('  no OOTB yet: put the graphite-configuration tar into images/ and run mdt init');
+  else {
+    const cmp = proj.compareTree(proj.trees()[0]);
+    console.log(`  OOTB        graphite-configuration ${meta.version}-${meta.release} (image ${meta.image.slice(0, 12)}), maximo-js-api ${meta.tools?.['maximo-js-api']}, ${meta.packages.join(', ')}`);
+    console.log(`  CUSTOMIZED  ${cmp.changed.length} changed, ${cmp.added.length} added, ${cmp.deleted.length} removed vs OOTB`);
   }
-  console.log(c.bold('apps'));
-  if (!Object.keys(cfg.apps).length) console.log('  none: put app source folders into apps/ and run mdt init');
-  for (const [id, a] of Object.entries(cfg.apps)) {
-    const ai = readAppInfo(abs(a.src)) || {};
-    console.log(`  ${id.padEnd(14)} ${String(ai.version || '?').padEnd(10)} ${a.src}`);
+  console.log(c.bold('MobileApps'));
+  const apps = Object.values(listApps());
+  if (!apps.length) console.log('  none: mdt ootb app <MAF Configuration download> (creates OOTB + CUSTOMIZED)');
+  for (const a of apps) {
+    const t = proj.trees().find(x => x.name === a.id);
+    const cmp = a.ootb && a.cust ? proj.compareTree(t) : null;
+    console.log(
+      `  ${a.id.padEnd(14)} ${a.folder.padEnd(14)} OOTB ${String(a.ootb?.info.version || c.yellow('missing')).padEnd(10)} CUSTOMIZED ${String(a.cust?.info.version || c.yellow('missing')).padEnd(10)}${cmp ? ` ${cmp.changed.length + cmp.added.length + cmp.deleted.length} file(s) customized` : ''}`
+    );
   }
-  console.log(c.bold('build env'));
+  const pending = proj.upgradePending();
+  if (pending) console.log(c.yellow(`\n${pending}`));
+  const st = readJson(path.join(P.upgrades, 'state.json'));
+  const first = proj.pendingOotb('HEAD').filter(p => p.initial);
+  if (first.length) console.log(c.yellow(`\nfirst OOTB import not committed yet (${[...new Set(first.map(p => p.root))].join(', ')}): git add -A && git commit`));
+  if (st && !pending && proj.pendingOotb('HEAD').some(p => !p.initial)) console.log(c.yellow(`\nupgrade merged, not committed yet (report: ${st.report})`));
+  const conflicts = proj.conflictFiles([P.fwCust, P.appsCust]);
+  if (conflicts.length) console.log(c.red(`\nunresolved conflict markers in ${conflicts.length} file(s):\n  ${conflicts.slice(0, 20).join('\n  ')}`));
+  console.log(c.bold('\nbuild env'));
   const env = Object.entries(cfg.buildEnv);
   console.log(env.length ? env.map(([k, v]) => `  ${k}=${v}`).join('\n') : '  (none: mdt env detect | mdt env set VITE_MAS_DOMAIN=...)');
   const targets = fs.existsSync(P.targets) ? fs.readdirSync(P.targets).filter(f => f.endsWith('.json') && f !== 'example.json') : [];
   console.log(c.bold('upload targets'));
   console.log(targets.length ? `  ${targets.map(f => f.replace(/\.json$/, '')).join(', ')}` : '  none (copy targets/example.json)');
-}
-
-function cmdImage(cfg, {pos, opt}) {
-  const sub = pos[0];
-  if (sub === 'list' || !sub) return cmdStatus(cfg);
-  if (sub === 'add') {
-    if (!pos[1] && !opt.id) fail('usage: mdt image add <file.tar> [--name N] | mdt image add --id <image>');
-    let tar = pos[1] ? path.resolve(pos[1]) : null;
-    if (tar && !tar.startsWith(P.images)) info('tip: keep image tars in images/ so mdt init finds them on a fresh setup');
-    return imageAdd(cfg, {tar, id: opt.id}, opt);
-  }
-  if (sub === 'use') {
-    const prof = profileOf(cfg, {profile: pos[1]});
-    cfg.activeProfile = prof.name;
-    saveCfg(cfg);
-    if (!fw.manifest(prof.name)) setupFramework(cfg, prof);
-    return ok(`active profile: ${prof.name}`);
-  }
-  if (sub === 'remove') return cmdImageRemove(cfg, pos[1], opt);
-  if (sub === 'build') return cmdImageBuild(cfg, opt);
-  fail(`unknown: mdt image ${sub}`);
-}
-
-function cmdImageRemove(cfg, name, opt) {
-  const prof = profileOf(cfg, {profile: name});
-  if (fw.manifest(prof.name) && fw.patchState(prof.name) === 'unsaved' && !opt.force) {
-    fail(`framework/${prof.name} has unsaved edits: run mdt framework save --profile ${prof.name} first (or --force)`);
-  }
-  fs.rmSync(P.framework(prof.name), {recursive: true, force: true});
-  fs.rmSync(P.baseline(prof.name), {recursive: true, force: true});
-  delete cfg.profiles[prof.name];
-  if (cfg.activeProfile === prof.name) cfg.activeProfile = Object.keys(cfg.profiles)[0] || null;
-  saveCfg(cfg);
-  if (opt.rmi && !Object.values(cfg.profiles).some(p => p.image === prof.image)) run(engine(cfg), ['rmi', prof.image], {allowFail: true});
-  ok(`removed profile ${prof.name}${opt.rmi ? ' and its image' : ''}`);
-}
-
-// Bake the saved framework patch into a new image (FROM the IBM image).
-function cmdImageBuild(cfg, opt) {
-  const prof = profileOf(cfg, opt);
-  const st = fw.status(prof.name);
-  if (!fw.editCount(st)) fail(`profile ${prof.name} has no framework edits to bake`);
-  const state = fw.patchState(prof.name);
-  if (state !== 'saved' && !opt['allow-unsaved']) fail(`framework edits are not saved (${state}): run mdt framework save first, so the image matches patches/framework.patch`);
-  const ctx = path.join(P.state, 'image-build', prof.name);
-  fs.rmSync(ctx, {recursive: true, force: true});
-  fs.mkdirSync(path.join(ctx, 'overlay'), {recursive: true});
-  info(`compiling ${fw.editCount(st)} framework file(s) with the image's Babel ...`);
-  const r = containerRun(
-    cfg,
-    prof.image,
-    [
-      [TOOL_DIR, '/mdt', 'ro'],
-      [P.framework(prof.name), '/framework', 'ro'],
-      [P.baseline(prof.name), '/baseline', 'ro'],
-      [ctx, '/out']
-    ],
-    {},
-    'node /mdt/container/compile-framework.cjs --framework /framework --baseline /baseline --overlay /out/overlay --report /out/framework-report.json'
-  );
-  if (r.status !== 0) fail('framework compile failed');
-  const report = readJson(path.join(ctx, 'framework-report.json'));
-  const files = [...walk(path.join(ctx, 'overlay'))];
-  const staleMaps = files.filter(f => f.endsWith('.js')).map(f => `/graphite/node_modules/@maximo/${f}.map`);
-  const patchSha = fw.patchFileSha();
-  const tag = opt.tag || `localhost/mdt/graphite-configuration:${prof.version || prof.name}-mdt.${stamp()}`;
-  const lines = [
-    `# generated by mdt image build - profile ${prof.name}`,
-    `FROM ${prof.image}`,
-    'USER root',
-    'COPY --chown=wiotp:root overlay/ /graphite/node_modules/@maximo/',
-    // IBM's external .map files no longer match the patched files (ours carry inline maps)
-    ...(staleMaps.length ? [`RUN rm -f ${staleMaps.join(' ')}`] : []),
-    `LABEL mdt.base-image="${prof.image}" mdt.profile="${prof.name}" mdt.framework-files="${report.changed.length + report.added.length}" mdt.patch-sha256="${patchSha || ''}"`,
-    'USER wiotp',
-    ''
-  ];
-  fs.writeFileSync(path.join(ctx, 'Containerfile'), lines.join('\n'));
-  fs.writeFileSync(path.join(ctx, 'CHANGES.txt'), [...report.changed.map(f => `M ${f}`), ...report.added.map(f => `A ${f}`)].join('\n') + '\n');
-  if (fs.existsSync(P.frameworkPatch)) fs.copyFileSync(P.frameworkPatch, path.join(ctx, 'framework.patch'));
-  info(`building ${tag}`);
-  run(engine(cfg), ['build', '-t', tag, '-f', path.join(ctx, 'Containerfile'), ctx]);
-
-  // verify: every overlay file inside the new image matches what we compiled
-  const inImage = files.map(f => `/graphite/node_modules/@maximo/${f}`);
-  const v = capture(engine(cfg), ['run', '--rm', tag, 'sha256sum', ...inImage]).stdout;
-  const want = Object.fromEntries(files.map(f => [`/graphite/node_modules/@maximo/${f}`, sha256File(path.join(ctx, 'overlay', f))]));
-  const bad = v.split(/\r?\n/).filter(Boolean).map(l => l.split(/\s+/)).filter(([h, f]) => want[f] !== h);
-  if (bad.length) fail(`image verification failed for: ${bad.map(b => b[1]).join(', ')}`);
-  ok(`verified ${files.length} file(s) in ${tag}`);
-
-  let saved = null;
-  if (opt.save) {
-    saved = path.resolve(opt.save === true ? path.join(P.dist, 'images', `graphite-configuration-${prof.name}-mdt-${stamp()}.tar`) : opt.save);
-    fs.mkdirSync(path.dirname(saved), {recursive: true});
-    info(`saving ${rel(saved)} (docker-archive, same format as IBM's tar) ...`);
-    run(engine(cfg), ['save', '--format', 'docker-archive', '-o', saved, tag]);
-  }
-  cfg.profiles[prof.name].derived = {tag, files: files.length, patchSha, tar: saved ? rel(saved) : null, builtAt: new Date().toISOString()};
-  saveCfg(cfg);
-  console.log(`\nBuild context: ${rel(ctx)}\nNext: push ${tag} to your registry and point the graphite-configuration deployment at it (README: "Shipping to production").`);
-}
-
-function cmdApp(cfg, {pos, opt}) {
-  const sub = pos[0];
-  if (sub === 'list' || !sub) return cmdStatus(cfg);
-  if (sub === 'add') {
-    const dir = path.resolve(pos[1] || '');
-    const ai = readAppInfo(dir);
-    if (!ai?.id) fail(`${dir} has no src/app.xml with an application id`);
-    const id = (opt.as || ai.id).toLowerCase();
-    cfg.apps[id] = {src: rel(dir)};
-    saveCfg(cfg);
-    return ok(`app ${id} ${ai.version} -> ${rel(dir)}`);
-  }
-  if (sub === 'remove') {
-    appOf(cfg, pos[1]);
-    delete cfg.apps[pos[1].toLowerCase()];
-    saveCfg(cfg);
-    return ok(`unregistered ${pos[1]} (files untouched)`);
-  }
-  if (sub === 'import') return cmdAppImport(cfg, pos[1], opt);
-  fail(`unknown: mdt app ${sub}`);
-}
-
-// Every bundle on the device carries app-source.zip (the full project).
-function cmdAppImport(cfg, appId, opt) {
-  appId = String(appId || '').toLowerCase();
-  if (!APP_ID_RE.test(appId)) fail('usage: mdt app import <appId> [--to Folder]');
-  const dest = path.resolve(opt.to || path.join(P.apps, appId.toUpperCase()));
-  if (fs.existsSync(dest) && fs.readdirSync(dest).length) fail(`${rel(dest)} exists and is not empty`);
-  const dev = new Device(cfg, opt).ensure();
-  if (!dev.listApps().includes(appId)) fail(`${appId} is not installed on the device`);
-  const zip = path.join(P.tmp, `${appId}-app-source.zip`);
-  if (dev.pullTo(`cat ${dev.appDir(appId)}/app-source.zip`, zip) < 100) fail(`no app-source.zip for ${appId} on the device`);
-  fs.mkdirSync(dest, {recursive: true});
-  run(tarExe(), ['-xf', zip, '-C', dest]);
-  fs.rmSync(zip, {force: true});
-  const ai = readAppInfo(dest);
-  cfg.apps[appId] = {src: rel(dest)};
-  saveCfg(cfg);
-  ok(`imported ${appId} ${ai?.version || ''} from the device into ${rel(dest)}`);
-  warn('these are the sources of the version deployed on the server; put them under git before editing');
+  const pol = loadPolicy().policy;
+  console.log(c.bold('agent policy') + `  ${Object.entries(pol).map(([k, v]) => `${k}=${v}`).join(' ')}${hookInstalled() ? '' : c.yellow('  (hook not installed)')}`);
 }
 
 function cmdEnv(cfg, {pos, opt}) {
   const sub = pos[0];
   if (sub === 'detect') {
-    const dev = new Device(cfg, opt).ensure();
-    const det = detectBuildEnv(dev, pos[1]);
+    const det = detectBuildEnv(new Device(cfg, opt).ensure(), pos[1]);
     if (!det) fail('no VITE_* build env found in the apps on the device');
     cfg.buildEnv = {...cfg.buildEnv, ...det.env};
     saveCfg(cfg);
@@ -373,136 +172,128 @@ function cmdEnv(cfg, {pos, opt}) {
   console.log(env.length ? env.map(([k, v]) => `${k}=${v}`).join('\n') : '(no build env)');
 }
 
-// ================================================================ framework
+// ================================================================ OOTB, diff, upgrade
 
-function cmdFramework(cfg, {pos, opt}) {
-  const sub = pos[0] || 'status';
-  const prof = profileOf(cfg, opt);
-  if (sub === 'extract') {
-    const packages = opt.packages ? String(opt.packages).split(',') : prof.packages || DEFAULT_PACKAGES;
-    if (opt.force && fw.manifest(prof.name) && fw.patchState(prof.name) === 'unsaved') fail('unsaved framework edits: mdt framework save first');
-    setupFramework(cfg, prof, packages, {force: !!opt.force});
-    cfg.profiles[prof.name].packages = [...new Set([...(prof.packages || []), ...packages])];
+function cmdOotb(cfg, {pos, opt}) {
+  const sub = pos[0];
+  if (sub === 'framework') {
+    proj.importFrameworkOotb(cfg, pos[1], opt.packages ? {packages: String(opt.packages).split(',')} : {});
     saveCfg(cfg);
-    return;
+    return afterOotb();
   }
-  if (!fw.manifest(prof.name)) fail(`framework for ${prof.name} not extracted: mdt framework extract`);
-  const st = fw.status(prof.name);
-  const state = fw.patchState(prof.name);
+  if (sub === 'app') {
+    const r = proj.importAppOotb(pos[1], {as: opt.as});
+    ok(`MobileApps/OOTB/${r.folder} = ${r.ai.id} ${r.ai.version}`);
+    for (const w of r.warnings) warn(`not pristine? ${w}`);
+    if (r.created) info(`MobileApps/CUSTOMIZED/${r.folder} created as a copy of OOTB`);
+    return afterOotb();
+  }
+  fail('usage: mdt ootb framework [image.tar] [--packages a,b] | mdt ootb app <download.zip|folder> [--as FOLDER]');
+}
 
-  if (sub === 'status') {
-    console.log(`framework/${prof.name}  (maximo-js-api ${prof.tools?.['maximo-js-api'] || '?'}, packages: ${Object.keys(fw.manifest(prof.name).packages).join(', ')})`);
-    for (const f of st.changed) console.log(`  ${c.yellow('M')} ${f}`);
-    for (const f of st.added) console.log(`  ${c.green('A')} ${f}`);
-    for (const f of st.deleted) console.log(`  ${c.red('D')} ${f} ${c.dim('(ignored at build: IBM file stays)')}`);
-    for (const f of st.rejects) console.log(`  ${c.red('!')} ${f} ${c.dim('(rejected hunk: fix the file, delete this, mdt framework save)')}`);
-    if (!fw.editCount(st) && !st.deleted.length) console.log('  no edits');
-    const msg = {
-      none: 'no patch',
-      saved: 'patches/framework.patch is up to date',
-      unsaved: 'edits differ from patches/framework.patch: run mdt framework save',
-      'not-loaded': 'patches/framework.patch has edits not in this working copy: run mdt framework load'
-    }[state];
-    console.log(`  ${state === 'unsaved' || state === 'not-loaded' ? c.yellow(msg) : c.dim(msg)}`);
-    return;
-  }
-  if (sub === 'diff') {
-    const patch = fw.diff(prof.name);
-    if (opt.out) {
-      fs.writeFileSync(path.resolve(opt.out), patch);
-      return ok(`wrote ${opt.out}`);
+function afterOotb() {
+  if (proj.upgradePending()) info('OOTB differs from the last commit: run mdt upgrade --dry-run, then mdt upgrade');
+  else if (proj.pendingOotb('HEAD').some(p => p.initial)) info('first import: commit it (git add -A && git commit) as the project\'s starting point');
+}
+
+function cmdDiff(cfg, {pos, opt}) {
+  const want = pos[0] ? String(pos[0]).toLowerCase() : null;
+  const list = proj.trees().filter(t => !want || t.name === want || t.folder?.toLowerCase() === want);
+  if (!list.length) fail(`unknown: ${pos[0]} (framework or an app id)`);
+  fs.mkdirSync(P.patches, {recursive: true});
+  for (const t of list) {
+    if (!fs.existsSync(t.ootb) || !fs.existsSync(t.cust)) {
+      warn(`${t.label}: OOTB or CUSTOMIZED missing`);
+      continue;
     }
-    return process.stdout.write(patch || '(no edits)\n');
-  }
-  if (sub === 'save') {
-    if (st.rejects.length) fail(`resolve and delete the reject files first: ${st.rejects.join(', ')}`);
-    if (state === 'not-loaded' && !opt.force) fail('the working copy has no edits but patches/framework.patch does: saving would erase it (mdt framework load, or --force)');
-    const r = fw.save(prof.name);
-    return ok(`patches/framework.patch: ${r.files} file(s) (commit it to keep your framework changes)`);
-  }
-  if (sub === 'load' || sub === 'reset') {
-    if (state === 'unsaved' && fw.editCount(st) && !opt.force) fail(`framework/${prof.name} has unsaved edits that ${sub} would discard (mdt framework save, or --force)`);
-    if (sub === 'reset') {
-      fw.reset(prof.name);
-      return ok(`framework/${prof.name} reset to IBM's sources`);
+    const {patch, cmp} = proj.patchOf(t);
+    const n = cmp.changed.length + cmp.added.length + cmp.deleted.length;
+    const file = path.join(P.patches, `${t.name}.patch`);
+    if (!opt['no-save']) fs.writeFileSync(file, patch);
+    console.log(`${c.bold(t.label.padEnd(24))} ${String(n).padStart(4)} file(s): ${cmp.changed.length} changed, ${cmp.added.length} added, ${cmp.deleted.length} removed${opt['no-save'] ? '' : `  -> ${rel(file)}`}`);
+    if (opt.stat || opt.files) {
+      for (const f of cmp.changed) console.log(`    M ${f}`);
+      for (const f of cmp.added) console.log(`    A ${f}`);
+      for (const f of cmp.deleted) console.log(`    D ${f}`);
     }
-    const r = fw.load(prof.name);
-    if (r.empty) return info('no patches/framework.patch: working copy is now IBM baseline');
-    if (!r.ok) warn(`resolve the *.rej files under framework/${prof.name}, then mdt framework save`);
-    return;
   }
-  if (sub === 'apply') {
-    const f = path.resolve(pos[1] || '');
-    if (!fs.existsSync(f)) fail('usage: mdt framework apply <file.patch>');
-    const r = fw.apply(prof.name, f);
-    if (r.ok) ok(`applied ${path.basename(f)} to framework/${prof.name} (mdt framework save to keep it)`);
-    return;
+}
+
+function cmdUpgrade(cfg, {opt}) {
+  const {results, runDir} = proj.upgrade(cfg, {base: opt.base || 'HEAD', dryRun: !!opt['dry-run'], force: !!opt.force});
+  const count = a => results.filter(r => r.action === a).length;
+  console.log(`\n${opt['dry-run'] ? c.bold('dry run: nothing written') : c.bold('merged into CUSTOMIZED')}`);
+  const rows = [
+    ['took IBM\'s new version', count('took-ibm')],
+    ['merged cleanly (both changed)', count('merged')],
+    ['added by IBM', count('added')],
+    ['deleted by IBM', count('deleted')],
+    ['kept yours', count('kept-yours')],
+    ['to review', count('review')],
+    ['CONFLICTS', count('conflict')]
+  ];
+  for (const [l, n] of rows) if (n) console.log(`  ${String(n).padStart(4)}  ${l}`);
+  for (const r of results.filter(x => x.action === 'conflict' || x.action === 'review')) console.log(`        ${r.action === 'conflict' ? c.red('C') : c.yellow('?')} ${r.file}${r.note ? c.dim(`  ${r.note}`) : ''}`);
+  console.log(`report: ${rel(path.join(runDir, 'REPORT.md'))}`);
+  if (!opt['dry-run']) {
+    const meta = proj.fwMeta();
+    console.log(`\nNext: resolve conflicts (search for <<<<<<<), mdt build <app> --debug, test, then\n  git add -A && git commit -m "Upgrade to ${meta ? `graphite-configuration ${meta.version}` : 'new IBM release'}"${meta ? ` && git tag ootb-${meta.version}` : ''}`);
   }
-  fail(`unknown: mdt framework ${sub}`);
 }
 
 // ================================================================ build / package / upload
 
 function buildApp(cfg, appRef, opt) {
-  const prof = profileOf(cfg, opt);
-  const app = appOf(cfg, appRef);
-  const src = abs(app.src);
-  const ai = readAppInfo(src);
-  if (!ai) fail(`${app.src} has no src/app.xml`);
-  const out = P.out(prof.name, app.id);
-  const haveFw = !!fw.manifest(prof.name);
-  const useFw = haveFw && !opt['no-framework'];
-  const st = haveFw ? fw.status(prof.name) : {changed: [], added: []};
-  if (useFw) {
-    const state = fw.patchState(prof.name);
-    if (state === 'not-loaded') warn('patches/framework.patch is not loaded in this working copy (mdt framework load)');
-    if (state === 'unsaved') info(c.yellow('building with framework edits that are not saved to patches/framework.patch'));
-  }
-  info(`build ${c.bold(app.id)} ${ai.version} with ${prof.name} (${opt.debug ? 'debug' : 'release'}, framework: ${useFw ? `${fw.editCount(st)} edit(s)` : 'stock'})`);
+  const meta = proj.buildImage(cfg);
+  const app = appOf(appRef);
+  if (!app.cust) fail(`MobileApps/CUSTOMIZED/${app.folder} is missing`);
+  const pending = proj.upgradePending();
+  if (pending) fail(pending);
+  const marks = proj.conflictFiles([app.cust.dir, P.fwCust]);
+  if (marks.length) fail(`unresolved conflict markers:\n  ${marks.join('\n  ')}`);
+  const out = P.out(app.id);
+  const useFw = !opt['no-framework'] && fs.existsSync(P.fwCust) && fs.existsSync(P.fwOotb);
+  const fwCmp = useFw ? proj.compareTree(proj.trees()[0]) : null;
+  info(
+    `build ${c.bold(app.id)} ${app.cust.info.version} on graphite-configuration ${meta.version} (${opt.debug ? 'debug' : 'release'}, framework: ${useFw ? `${fwCmp.changed.length + fwCmp.added.length} customized file(s)` : 'stock'})`
+  );
   const mounts = [
-    [src, '/src', 'ro'],
+    [app.cust.dir, '/src', 'ro'],
     [TOOL_DIR, '/mdt', 'ro'],
     [out, '/out']
   ];
-  if (useFw) mounts.push([P.framework(prof.name), '/framework', 'ro'], [P.baseline(prof.name), '/baseline', 'ro']);
+  if (useFw) mounts.push([P.fwCust, '/framework', 'ro'], [P.fwOotb, '/ootb', 'ro']);
   // VITE_*/REACT_APP_* end up in the app's process.env; the MAS pod sets
   // VITE_ROUTING_MODE, VITE_MAS_DOMAIN, VITE_ROOT_PATH (mdt env detect copies them)
-  const env = Object.fromEntries(Object.entries({...cfg.buildEnv, ...(prof.buildEnv || {})}).filter(([k]) => /^(VITE_|REACT_APP_|GRAPHITE_)/.test(k)));
+  const env = Object.fromEntries(Object.entries(cfg.buildEnv || {}).filter(([k]) => /^(VITE_|REACT_APP_|GRAPHITE_)/.test(k)));
   const t0 = Date.now();
   const r = containerRun(
     cfg,
-    prof.image,
+    meta.image,
     mounts,
     {...env, MDT_DEBUG: opt.debug ? '1' : '0', MDT_FRAMEWORK: useFw ? '1' : '0', MDT_TEST_HOOK: opt['no-test-hook'] ? '0' : '1'},
     containerScript('build-app.sh')
   );
   if (r.status !== 0) fail(`build failed (exit ${r.status})`);
-  const meta = readJson(path.join(out, 'mdt-build.json'));
-  if (!meta) fail('build finished without mdt-build.json');
-  const git = args => capture('git', ['-C', src, ...args], {allowFail: true}).stdout?.trim() || null;
-  Object.assign(meta, {
-    profile: prof.name,
-    image: prof.image,
-    tools: prof.tools,
-    app: {id: app.id, masId: ai.masId, title: ai.title, platform: ai.platform, source: app.src, commit: git(['rev-parse', '--short', 'HEAD']), dirty: !!git(['status', '--porcelain'])},
-    buildEnv: env,
-    patchState: useFw ? fw.patchState(prof.name) : 'stock',
-    patchSha: useFw ? fw.patchFileSha() : null
+  const bm = readJson(path.join(out, 'mdt-build.json')) || fail('build finished without mdt-build.json');
+  const gitv = args => (proj.isGitRepo() ? git(args, {allowFail: true}).stdout?.trim() || null : null);
+  const custRel = rel(app.cust.dir);
+  Object.assign(bm, {
+    image: meta.image,
+    ootb: {framework: `${meta.version}-${meta.release}`, frameworkTools: meta.tools, app: app.ootb?.info.version || null},
+    app: {id: app.id, folder: app.folder, masId: app.cust.info.masId, title: app.cust.info.title, platform: app.cust.info.platform},
+    commit: gitv(['rev-parse', '--short', 'HEAD']),
+    dirty: !!gitv(['status', '--porcelain', '--', custRel, 'Framework/CUSTOMIZED']),
+    buildEnv: env
   });
-  fs.writeFileSync(path.join(out, 'mdt-build.json'), JSON.stringify(meta, null, 1));
-  ok(`built ${rel(path.join(out, meta.zip))} in ${Math.round((Date.now() - t0) / 1000)}s`);
-  return {prof, app, out, meta};
+  fs.writeFileSync(path.join(out, 'mdt-build.json'), JSON.stringify(bm, null, 1));
+  ok(`built ${rel(path.join(out, bm.zip))} in ${Math.round((Date.now() - t0) / 1000)}s`);
+  return {app, out, meta: bm};
 }
 
 function cmdPackage(cfg, appRef, opt) {
-  const prof = profileOf(cfg, opt);
-  if (fw.manifest(prof.name) && !opt['no-framework']) {
-    const state = fw.patchState(prof.name);
-    if ((state === 'unsaved' || state === 'not-loaded') && !opt['allow-unsaved']) {
-      fail(`framework working copy and patches/framework.patch differ (${state}); save or load first so the release is reproducible (or --allow-unsaved)`);
-    }
-  }
   const {app, out, meta} = buildApp(cfg, appRef, {...opt, debug: false});
+  if (meta.dirty) warn('CUSTOMIZED has uncommitted changes: release.json records the commit plus "dirty"');
   const dir = path.join(P.dist, app.id, `${meta.version}-${stamp()}`);
   fs.mkdirSync(dir, {recursive: true});
   const artifacts = {};
@@ -510,14 +301,13 @@ function cmdPackage(cfg, appRef, opt) {
     fs.copyFileSync(path.join(out, f), path.join(dir, f));
     artifacts[f] = sha256File(path.join(dir, f));
   }
-  if (meta.patchSha && fs.existsSync(P.frameworkPatch)) fs.copyFileSync(P.frameworkPatch, path.join(dir, 'framework.patch'));
   fs.writeFileSync(path.join(dir, 'release.json'), JSON.stringify({...meta, artifacts, packagedAt: new Date().toISOString()}, null, 1));
   console.log(`\n${c.bold(rel(dir))}`);
   console.log(`  ${meta.zip.padEnd(34)} app binary for Maximo: mdt upload ${app.id} --target <name>`);
   console.log(`  ${`${meta.appId}.zip`.padEnd(34)} sources for the MAS Configuration app (Upload), rebuilt there`);
   console.log(`  ${'app-source.zip'.padEnd(34)} raw source archive (the one inside the binary)`);
-  console.log(`  ${'release.json'.padEnd(34)} versions, image, framework patch, git commit, sha256`);
-  console.log(`Test this exact build on the device: mdt push ${app.id}`);
+  console.log(`  ${'release.json'.padEnd(34)} versions, image, git commit, sha256`);
+  console.log(`Test this exact build on the device: mdt push ${app.id} --release`);
   return dir;
 }
 
@@ -534,29 +324,110 @@ function latestRelease(appId, which) {
 }
 
 async function cmdUpload(cfg, appRef, opt) {
-  const app = appOf(cfg, appRef);
+  const app = appOf(appRef);
   const t = loadTarget(opt.target);
   const dir = latestRelease(app.id, opt.release);
   const rj = readJson(path.join(dir, 'release.json'));
   const zip = path.join(dir, rj.zip);
   if (sha256File(zip) !== rj.artifacts[rj.zip]) fail(`${rj.zip} does not match release.json (modified?)`);
   if (rj.debug) fail('refusing to upload a debug build');
-  console.log(`release ${rel(dir)}: ${rj.appId} ${rj.version}, ${rj.profile}, framework ${rj.framework ? `${rj.framework.changed.length + rj.framework.added.length} file(s)` : 'stock'}, source ${rj.app?.commit || '?'}${rj.app?.dirty ? ' (dirty)' : ''}`);
+  console.log(`release ${rel(dir)}: ${rj.appId} ${rj.version}, framework OOTB ${rj.ootb?.framework}, ${rj.framework ? `${rj.framework.changed.length + rj.framework.added.length} customized framework file(s)` : 'stock framework'}, commit ${rj.commit || '?'}${rj.dirty ? ' (dirty)' : ''}`);
   console.log(`target  ${describeTarget(t)}`);
   if (!opt.yes && !opt['dry-run']) await confirm(`Upload ${rj.appId} ${rj.version} to ${t.name}? Type the app id to confirm:`, rj.appId);
   uploadZip(t, {appId: rj.appId, masId: rj.app?.masId, version: rj.version, description: rj.app?.title}, zip, {dryRun: !!opt['dry-run']});
   if (!opt['dry-run']) {
-    const log = path.join(dir, 'uploads.log');
-    fs.appendFileSync(log, `${new Date().toISOString()} ${t.name} ${t.domain}\n`);
+    fs.appendFileSync(path.join(dir, 'uploads.log'), `${new Date().toISOString()} ${t.name} ${t.domain}\n`);
     console.log('Devices pick the new version up on their next app update check / login.');
   }
 }
 
+// Bake Framework/CUSTOMIZED (its difference to OOTB) into a new image.
+function cmdImageBuild(cfg, opt) {
+  const meta = proj.buildImage(cfg);
+  const cmp = proj.compareTree(proj.trees()[0]);
+  if (!cmp.changed.length && !cmp.added.length) fail('Framework/CUSTOMIZED has no changes vs OOTB: nothing to bake');
+  const marks = proj.conflictFiles([P.fwCust]);
+  if (marks.length) fail(`unresolved conflict markers:\n  ${marks.join('\n  ')}`);
+  const ctx = path.join(P.state, 'image-build');
+  fs.rmSync(ctx, {recursive: true, force: true});
+  fs.mkdirSync(path.join(ctx, 'overlay'), {recursive: true});
+  info(`compiling ${cmp.changed.length + cmp.added.length} framework file(s) with the image's Babel ...`);
+  const r = containerRun(
+    cfg,
+    meta.image,
+    [
+      [TOOL_DIR, '/mdt', 'ro'],
+      [P.fwCust, '/framework', 'ro'],
+      [P.fwOotb, '/ootb', 'ro'],
+      [ctx, '/out']
+    ],
+    {},
+    'node /mdt/container/compile-framework.cjs --framework /framework --ootb /ootb --overlay /out/overlay --report /out/framework-report.json'
+  );
+  if (r.status !== 0) fail('framework compile failed');
+  const report = readJson(path.join(ctx, 'framework-report.json'));
+  const files = [...walk(path.join(ctx, 'overlay'))];
+  const staleMaps = files.filter(f => f.endsWith('.js')).map(f => `/graphite/node_modules/@maximo/${f}.map`);
+  const commit = proj.isGitRepo() ? git(['rev-parse', '--short', 'HEAD'], {allowFail: true}).stdout.trim() : '';
+  const tag = opt.tag || `localhost/mdt/graphite-configuration:${meta.version}-mdt.${stamp()}`;
+  const lines = [
+    '# generated by mdt image build',
+    `FROM ${meta.image}`,
+    'USER root',
+    'COPY --chown=wiotp:root overlay/ /graphite/node_modules/@maximo/',
+    // IBM's external .map files no longer match the patched files (ours carry inline maps)
+    ...(staleMaps.length ? [`RUN rm -f ${staleMaps.join(' ')}`] : []),
+    `LABEL mdt.base-image="${meta.image}" mdt.framework-files="${report.changed.length + report.added.length}" mdt.commit="${commit}"`,
+    'USER wiotp',
+    ''
+  ];
+  fs.writeFileSync(path.join(ctx, 'Containerfile'), lines.join('\n'));
+  fs.writeFileSync(path.join(ctx, 'CHANGES.txt'), [...report.changed.map(f => `M ${f}`), ...report.added.map(f => `A ${f}`)].join('\n') + '\n');
+  info(`building ${tag}`);
+  run(engine(cfg), ['build', '-t', tag, '-f', path.join(ctx, 'Containerfile'), ctx]);
+  const inImage = files.map(f => `/graphite/node_modules/@maximo/${f}`);
+  const v = capture(engine(cfg), ['run', '--rm', tag, 'sha256sum', ...inImage]).stdout;
+  const want = Object.fromEntries(files.map(f => [`/graphite/node_modules/@maximo/${f}`, sha256File(path.join(ctx, 'overlay', f))]));
+  const bad = v.split(/\r?\n/).filter(Boolean).map(l => l.split(/\s+/)).filter(([h, f]) => want[f] !== h);
+  if (bad.length) fail(`image verification failed for: ${bad.map(b => b[1]).join(', ')}`);
+  ok(`verified ${files.length} file(s) in ${tag}`);
+  if (opt.save) {
+    const saved = path.resolve(opt.save === true ? path.join(P.dist, 'images', `graphite-configuration-${meta.version}-mdt-${stamp()}.tar`) : opt.save);
+    fs.mkdirSync(path.dirname(saved), {recursive: true});
+    info(`saving ${rel(saved)} (docker-archive, same format as IBM's tar) ...`);
+    run(engine(cfg), ['save', '--format', 'docker-archive', '-o', saved, tag]);
+  }
+  console.log(`\nBuild context: ${rel(ctx)}\nNext: push ${tag} to your registry and point the graphite-configuration deployment at it (README: "Shipping to production").`);
+}
+
 // ================================================================ device
 
+// Every bundle on the device carries app-source.zip (the full project).
+function cmdAppImport(cfg, appId, opt) {
+  appId = String(appId || '').toLowerCase();
+  if (!APP_ID_RE.test(appId)) fail('usage: mdt app import <appId> [--ootb] [--as FOLDER]');
+  const dev = new Device(cfg, opt).ensure();
+  if (!dev.listApps().includes(appId)) fail(`${appId} is not installed on the device`);
+  const zip = path.join(P.tmp, `${appId}-app-source.zip`);
+  if (dev.pullTo(`cat ${dev.appDir(appId)}/app-source.zip`, zip) < 100) fail(`no app-source.zip for ${appId} on the device`);
+  if (opt.ootb) {
+    const r = proj.importAppOotb(zip, {as: opt.as});
+    ok(`MobileApps/OOTB/${r.folder} = ${appId} ${r.ai.version} from the device`);
+    for (const w of r.warnings) warn(`not pristine? ${w}`);
+    return;
+  }
+  const folder = opt.as || appId.toUpperCase();
+  const dest = path.join(P.appsCust, folder);
+  if (fs.existsSync(dest) && fs.readdirSync(dest).length) fail(`${rel(dest)} exists and is not empty`);
+  fs.mkdirSync(dest, {recursive: true});
+  run(tarExe(), ['-xf', zip, '-C', dest]);
+  fs.rmSync(zip, {force: true});
+  ok(`MobileApps/CUSTOMIZED/${folder} = ${appId} as deployed on the server`);
+  warn(`add its pristine version too (mdt ootb app <download> --as ${folder}) so upgrades can merge it`);
+}
+
 function buildFor(cfg, appRef, opt) {
-  const prof = profileOf(cfg, opt);
-  const app = appOf(cfg, appRef);
+  const app = appOf(appRef);
   if (opt.release) {
     const dir = latestRelease(app.id, opt.release);
     const rj = readJson(path.join(dir, 'release.json'));
@@ -565,9 +436,8 @@ function buildFor(cfg, appRef, opt) {
     fs.writeFileSync(idx, capture(tarExe(), ['-xOf', path.join(dir, rj.zip), 'index.html'], {binary: true}).stdout);
     return {app, meta: rj, zip: path.join(dir, rj.zip), index: idx, from: rel(dir)};
   }
-  const out = P.out(prof.name, app.id);
-  const meta = readJson(path.join(out, 'mdt-build.json'));
-  if (!meta) fail(`no build for ${app.id} in profile ${prof.name}: mdt build ${app.id}`);
+  const out = P.out(app.id);
+  const meta = readJson(path.join(out, 'mdt-build.json')) || fail(`no build for ${app.id}: mdt build ${app.id}`);
   return {app, meta, zip: path.join(out, meta.zip), index: path.join(out, 'www', 'index.html'), from: rel(out)};
 }
 
@@ -625,16 +495,8 @@ function cmdPolicy(cfg, {pos}) {
   }
   const {policy, sources} = loadPolicy();
   console.log(c.bold('agent policy') + c.dim('  (AGENTS.md, overridden by AGENTS.local.md)'));
-  for (const [k, v] of Object.entries(policy)) {
-    console.log(`  ${k.padEnd(12)} ${v.padEnd(10)} ${c.dim(`${sources[k]}   options: ${LEVELS[k].join(' | ')}`)}`);
-  }
+  for (const [k, v] of Object.entries(policy)) console.log(`  ${k.padEnd(12)} ${v.padEnd(10)} ${c.dim(`${sources[k]}   options: ${LEVELS[k].join(' | ')}`)}`);
   console.log(hookInstalled() ? c.dim('  Claude Code hook: installed (.claude/settings.json)') : c.yellow(`  ${HOOK_HINT}`));
-}
-
-const HOOK_HINT = 'Claude Code hook NOT installed: copy mdt/agent/claude-settings.json to .claude/settings.json (then commit it)';
-function hookInstalled() {
-  const f = path.join(ROOT, '.claude', 'settings.json');
-  return fs.existsSync(f) && fs.readFileSync(f, 'utf8').includes('policy-hook.mjs');
 }
 
 // Refuse blocked actions for non-interactive callers (agents). People in a
@@ -669,10 +531,9 @@ async function cmdDrive(cfg, cmd, rest, opt) {
     case 'wait':
       if (!rest[0] && !opt.selector) fail('usage: mdt wait "<text>" | --selector <css>  [--timeout 20] [--gone]');
       return drive.waitFor(dev, rest[0], opt);
-    case 'eval': {
+    case 'eval':
       if (!rest[0]) fail('usage: mdt eval "<js expression>" [--app <id>|navigator]');
       return console.log(JSON.stringify(await drive.evalJs(dev, rest[0], {app}), null, 1));
-    }
     case 'state': {
       const st = await drive.appState(dev, {app});
       if (st?.error) fail(st.error);
@@ -687,9 +548,8 @@ async function cmdDrive(cfg, cmd, rest, opt) {
       return info(`${msgs.length} message(s)${opt.errors ? ' (errors/warnings only)' : ''}`);
     }
     case 'screenshot': {
-      const out = opt.out ? path.resolve(opt.out) : undefined;
-      const f = opt.webview ? await drive.webviewScreenshot(dev, out) : drive.screenshot(dev, out);
-      return console.log(f);
+      const outFile = opt.out ? path.resolve(opt.out) : undefined;
+      return console.log(opt.webview ? await drive.webviewScreenshot(dev, outFile) : drive.screenshot(dev, outFile));
     }
     case 'logcat':
       return console.log(drive.logcat(dev, opt));
@@ -698,37 +558,35 @@ async function cmdDrive(cfg, cmd, rest, opt) {
 
 // ================================================================ main
 
-const HELP =`mdt - Maximo Mobile dev toolkit   (workspace ${ROOT})
+const HELP = `mdt - Maximo Mobile dev toolkit   (project ${ROOT})
+
+project layout
+  Framework/OOTB  Framework/CUSTOMIZED        IBM framework / yours (builds use CUSTOMIZED)
+  MobileApps/OOTB/<APP>  MobileApps/CUSTOMIZED/<APP>   IBM app / yours
 
 setup
-  init                        set up / refresh: images/*.tar -> profiles, apps/* -> apps, device env
-  doctor                      check node, podman, git, curl, adb, device
-  status                      profiles, apps, build env, targets
-  image add <tar> [--name N] | image use <profile> | image remove <profile> [--rmi]
-  app add <folder> [--as id] | app remove <id> | app import <appId> [--to Folder]
+  init                        prerequisites, Framework/OOTB from images/*.tar, build env from the device
+  doctor | status
   env | env detect [app] | env set VITE_X=... | env unset VITE_X
 
-framework   (edit framework/<profile>/<package>/..., keep edits in patches/framework.patch)
-  framework status            edits vs IBM baseline, patch state
-  framework save              working copy -> patches/framework.patch (commit it)
-  framework load              IBM baseline + patches/framework.patch -> working copy
-  framework reset             working copy -> IBM baseline
-  framework diff [--out f]  | framework apply <f.patch> | framework extract [--packages a,b]
+OOTB, customizations, Maximo upgrades
+  ootb framework [image.tar] [--packages a,b]     Framework/OOTB := sources from the image
+  ootb app <download.zip|folder> [--as FOLDER]    MobileApps/OOTB/<APP> := pristine app download
+  diff [framework|<app>] [--files] [--no-save]    CUSTOMIZED vs OOTB -> patches/<name>.patch
+  upgrade [--dry-run] [--base REF] [--force]      merge OOTB changes since REF (default HEAD) into CUSTOMIZED
 
 build & device   (device commands need a debuggable Maximo Mobile APK)
   build <app> [--debug] [--no-framework]
-  device                      APK + installed app versions (read-only)
-  backup <app>                copy the app bundle from the device (read-only)
+  device | backup <app> | app import <appId> [--ootb] [--as FOLDER]
   push <app> [--release [dir]] [--dry-run] [--no-backup] [--no-reload] [--restart] [--keep-old-assets]
   deploy <app> [--debug]      build + push
-  reload [app] [--restart]    reload the app in Navigator, or restart the APK
-  restore <app> [backup.tar]  default: oldest backup
+  reload [app] [--restart] | restore <app> [backup.tar]
 
 drive & test the app on the device   (target = visible app; --app <id>|navigator)
   ui [--all] [--json]         visible controls as [ref] lines + page text
-  tap <ref|"text"> | --selector css | --xy x,y [--nth N] [--js]
+  tap <ref|"text"> | --id <element id> | --selector css | --xy x,y [--nth N] [--js]
   type <ref|"text"> "value" [--clear] [--enter]
-  key back|enter|tab|escape|backspace|arrowdown|arrowup
+  key back|wake|enter|tab|escape|backspace|arrowdown|arrowup
   scroll [down|up|<ref>]      wait "<text>" | --selector css [--timeout 20] [--gone]
   state                       page, page stack, datasource counts (debug builds)
   eval "<js>"                 run JS in the app window, print the result
@@ -736,21 +594,20 @@ drive & test the app on the device   (target = visible app; --app <id>|navigator
   screenshot [--webview] [--out f.png]
 
 agent policy   (AGENTS.md defaults, AGENTS.local.md per clone; enforced by the Claude Code hook)
-  policy                      show the effective policy
-  policy set device=auto device-ui=ask framework=read-only apps=auto uploads=never ...
+  policy | policy set device=auto device-ui=ask framework=read-only apps=auto uploads=never ...
 
 release
   package <app>               release build -> dist/<app>/<version>-<time>/ (binary, source zips, release.json)
   upload <app> --target T [--release dir] [--dry-run] [--yes]   send the packaged binary to Maximo
   publish <app> --target T    package + upload
-  image build [--tag T] [--save [file.tar]]   bake patches/framework.patch into a new image
+  image build [--tag T] [--save [file.tar]]   bake Framework/CUSTOMIZED into a new image
 
-options: --profile <name> (default: active)  --serial <adb serial>
+options: --serial <adb serial>
 `;
 
 const VALUE_OPTS = new Set([
-  'profile', 'packages', 'name', 'id', 'tag', 'save', 'out', 'target', 'release', 'serial', 'as', 'to',
-  'app', 'selector', 'text', 'nth', 'xy', 'seconds', 'timeout', 'lines', 'grep', 'limit', 'text-limit'
+  'packages', 'name', 'tag', 'save', 'out', 'target', 'release', 'serial', 'as', 'to', 'base',
+  'app', 'selector', 'text', 'nth', 'xy', 'seconds', 'timeout', 'lines', 'grep', 'limit', 'text-limit', 'id'
 ]);
 
 function parseArgs(argv) {
@@ -775,35 +632,22 @@ async function main() {
   const a = {pos: rest, opt};
   enforcePolicy(process.argv.slice(2));
   switch (cmd) {
-    case 'policy':
-      return cmdPolicy(cfg, a);
-    case 'ui':
-    case 'tap':
-    case 'type':
-    case 'key':
-    case 'scroll':
-    case 'wait':
-    case 'eval':
-    case 'state':
-    case 'console':
-    case 'screenshot':
-    case 'logcat':
-      return cmdDrive(cfg, cmd, rest, opt);
     case 'init':
       return cmdInit(cfg, a);
     case 'doctor':
       return void doctor(cfg);
     case 'status':
       return cmdStatus(cfg);
-    case 'image':
-      return cmdImage(cfg, a);
-    case 'app':
-      return cmdApp(cfg, a);
     case 'env':
       return cmdEnv(cfg, a);
-    case 'framework':
-    case 'fw':
-      return cmdFramework(cfg, a);
+    case 'policy':
+      return cmdPolicy(cfg, a);
+    case 'ootb':
+      return cmdOotb(cfg, a);
+    case 'diff':
+      return cmdDiff(cfg, a);
+    case 'upgrade':
+      return cmdUpgrade(cfg, a);
     case 'build':
       return void buildApp(cfg, rest[0], opt);
     case 'package':
@@ -815,6 +659,14 @@ async function main() {
       const dir = cmdPackage(cfg, rest[0], opt);
       return cmdUpload(cfg, rest[0], {...opt, release: dir});
     }
+    case 'image':
+      if (rest[0] === 'build') return cmdImageBuild(cfg, opt);
+      fail('usage: mdt image build [--tag T] [--save [file.tar]]');
+      break;
+    case 'app':
+      if (rest[0] === 'import') return cmdAppImport(cfg, rest[1], opt);
+      fail('usage: mdt app import <appId> [--ootb] [--as FOLDER]');
+      break;
     case 'device':
       return printDevice(new Device(cfg, opt));
     case 'backup': {
@@ -832,6 +684,18 @@ async function main() {
       return reload(new Device(cfg, opt).ensure(), String(rest[0] || 'navigator').toLowerCase(), {restart: !!opt.restart});
     case 'restore':
       return cmdRestore(cfg, rest[0], rest[1], opt);
+    case 'ui':
+    case 'tap':
+    case 'type':
+    case 'key':
+    case 'scroll':
+    case 'wait':
+    case 'eval':
+    case 'state':
+    case 'console':
+    case 'screenshot':
+    case 'logcat':
+      return cmdDrive(cfg, cmd, rest, opt);
     default:
       process.stdout.write(HELP);
   }

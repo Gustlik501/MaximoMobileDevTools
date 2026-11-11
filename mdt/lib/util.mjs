@@ -1,4 +1,4 @@
-// Shared helpers: paths, logging, processes, config.
+// Shared helpers: paths, logging, processes, config, app discovery.
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -9,22 +9,31 @@ import {fileURLToPath} from 'node:url';
 export const TOOL_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 export const ROOT = path.resolve(TOOL_DIR, '..');
 
-// Workspace layout. Everything except mdt/, patches/, targets/example.json and
-// the docs is environment data and git-ignored.
+// Project layout (one repo per customer project):
+//   Framework/OOTB/<package>/        IBM framework sources, extracted from the image
+//   Framework/CUSTOMIZED/<package>/  your framework (what builds use)
+//   Framework/ootb.json              which image Framework/OOTB came from
+//   MobileApps/OOTB/<APP>/           IBM app sources as shipped (MAF Configuration download)
+//   MobileApps/CUSTOMIZED/<APP>/     your apps (what builds use)
+//   images/ out/ dist/ .mdt/ mdt.json targets/*.json   local only (git-ignored)
 export const P = {
   cfg: path.join(ROOT, 'mdt.json'),
   state: path.join(ROOT, '.mdt'),
+  tmp: path.join(ROOT, '.mdt', 'tmp'),
+  upgrades: path.join(ROOT, '.mdt', 'upgrade'),
   images: path.join(ROOT, 'images'),
-  apps: path.join(ROOT, 'apps'),
   patches: path.join(ROOT, 'patches'),
-  frameworkPatch: path.join(ROOT, 'patches', 'framework.patch'),
   targets: path.join(ROOT, 'targets'),
   dist: path.join(ROOT, 'dist'),
-  framework: profile => path.join(ROOT, 'framework', profile),
-  baseline: profile => path.join(ROOT, '.mdt', 'baseline', profile),
-  out: (profile, appId) => path.join(ROOT, 'out', profile, appId),
-  backups: appId => path.join(ROOT, '.mdt', 'backups', appId),
-  tmp: path.join(ROOT, '.mdt', 'tmp')
+  fw: path.join(ROOT, 'Framework'),
+  fwOotb: path.join(ROOT, 'Framework', 'OOTB'),
+  fwCust: path.join(ROOT, 'Framework', 'CUSTOMIZED'),
+  fwMeta: path.join(ROOT, 'Framework', 'ootb.json'),
+  apps: path.join(ROOT, 'MobileApps'),
+  appsOotb: path.join(ROOT, 'MobileApps', 'OOTB'),
+  appsCust: path.join(ROOT, 'MobileApps', 'CUSTOMIZED'),
+  out: appId => path.join(ROOT, 'out', appId),
+  backups: appId => path.join(ROOT, '.mdt', 'backups', appId)
 };
 
 export const APP_ID_RE = /^[a-z0-9][a-z0-9_-]*$/i;
@@ -68,6 +77,11 @@ const sys32 = exe => path.join(process.env.SystemRoot || 'C:\\Windows', 'System3
 export const tarExe = () => (process.platform === 'win32' && fs.existsSync(sys32('tar.exe')) ? sys32('tar.exe') : 'tar');
 export const curlExe = () => (process.platform === 'win32' && fs.existsSync(sys32('curl.exe')) ? sys32('curl.exe') : 'curl');
 
+/** git in the project, with stable output (no CRLF conversion, no quoted paths) */
+export function git(args, opts = {}) {
+  return capture('git', ['-c', 'core.autocrlf=false', '-c', 'core.quotepath=false', ...args], {cwd: ROOT, ...opts});
+}
+
 // ---------------------------------------------------------------- files
 
 export const rel = p => path.relative(ROOT, p).split(path.sep).join('/') || '.';
@@ -81,12 +95,14 @@ export function stamp() {
   return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
 }
 
+const SKIP_DIRS = new Set(['.git', 'node_modules', 'build', 'coverage']);
 export function* walk(dir, r = '') {
   if (!fs.existsSync(path.join(dir, r))) return;
   for (const e of fs.readdirSync(path.join(dir, r), {withFileTypes: true})) {
     const x = r ? `${r}/${e.name}` : e.name;
-    if (e.isDirectory()) yield* walk(dir, x);
-    else if (e.isFile()) yield x;
+    if (e.isDirectory()) {
+      if (!SKIP_DIRS.has(e.name)) yield* walk(dir, x);
+    } else if (e.isFile()) yield x;
   }
 }
 
@@ -98,6 +114,10 @@ export const readJson = (f, dflt = null) => {
   }
 };
 
+export const isBinary = buf => buf.subarray(0, 8000).includes(0);
+/** CRLF -> LF for text; binary unchanged */
+export const normalize = buf => (isBinary(buf) ? buf : Buffer.from(buf.toString('utf8').replace(/\r\n/g, '\n'), 'utf8'));
+
 export async function confirm(question, expected) {
   if (!process.stdin.isTTY) fail(`${question}\n  (needs an interactive terminal, or pass --yes)`);
   const rl = readline.createInterface({input: process.stdin, output: process.stdout});
@@ -106,13 +126,10 @@ export async function confirm(question, expected) {
   if (expected ? ans !== expected : !/^y(es)?$/i.test(ans)) fail('cancelled');
 }
 
-// ---------------------------------------------------------------- config (mdt.json)
+// ---------------------------------------------------------------- config (mdt.json, local only)
 
 export function loadCfg() {
   const cfg = readJson(P.cfg, {});
-  cfg.activeProfile ??= null;
-  cfg.profiles ??= {};
-  cfg.apps ??= {};
   cfg.device ??= {};
   cfg.device.package ??= 'com.ibm.iot.maximo.mobile';
   cfg.container ??= {};
@@ -122,13 +139,7 @@ export function loadCfg() {
 
 export const saveCfg = cfg => fs.writeFileSync(P.cfg, `${JSON.stringify(cfg, null, 2)}\n`);
 
-export function profileOf(cfg, opt = {}) {
-  const name = opt.profile || cfg.activeProfile;
-  if (!name) fail('no image profile yet: put a graphite-configuration .tar into images/ and run `mdt init`');
-  const p = cfg.profiles[name];
-  if (!p) fail(`unknown profile "${name}" (have: ${Object.keys(cfg.profiles).join(', ') || 'none'})`);
-  return {name, ...p};
-}
+// ---------------------------------------------------------------- apps
 
 // app.xml root is <maximo-application> (most apps) or <application> (navigator).
 // Attribute values can hold JS expressions, so scan to the '>' outside quotes.
@@ -153,21 +164,31 @@ export function readAppInfo(dir) {
   const tag = head.slice(m.index, end + 1);
   const attr = n => (tag.match(new RegExp(`\\s${n}="([^"]*)"`)) || [])[1];
   const pkg = readJson(path.join(dir, 'package.json'), {});
-  return {
-    id: attr('id'),
-    version: attr('version'),
-    title: attr('title'),
-    masId: attr('mas-id') || null,
-    platform: pkg.graphite?.platform || null
-  };
+  return {id: attr('id'), version: attr('version'), title: attr('title'), masId: attr('mas-id') || null, platform: pkg.graphite?.platform || null};
 }
 
-export function appOf(cfg, idOrDir) {
-  if (!idOrDir) fail(`which app? (have: ${Object.keys(cfg.apps).join(', ') || 'none'})`);
-  const key = String(idOrDir).toLowerCase();
-  if (cfg.apps[key]) return {id: key, ...cfg.apps[key]};
-  for (const [id, a] of Object.entries(cfg.apps)) {
-    if (path.basename(a.src).toLowerCase() === key) return {id, ...a};
+/** Apps found in MobileApps/CUSTOMIZED and MobileApps/OOTB, keyed by app id. */
+export function listApps() {
+  const apps = {};
+  for (const [kind, base] of [['cust', P.appsCust], ['ootb', P.appsOotb]]) {
+    if (!fs.existsSync(base)) continue;
+    for (const e of fs.readdirSync(base, {withFileTypes: true})) {
+      if (!e.isDirectory() || e.name.startsWith('.')) continue;
+      const dir = path.join(base, e.name);
+      const ai = readAppInfo(dir);
+      if (!ai?.id) continue;
+      const id = ai.id.toLowerCase();
+      apps[id] ??= {id, folder: e.name};
+      apps[id][kind] = {dir, info: ai};
+    }
   }
-  fail(`unknown app "${idOrDir}" (have: ${Object.keys(cfg.apps).join(', ') || 'none'}; put it in apps/ and run mdt init)`);
+  return apps;
+}
+
+export function appOf(ref) {
+  const apps = listApps();
+  const key = String(ref || '').toLowerCase();
+  const hit = apps[key] || Object.values(apps).find(a => a.folder.toLowerCase() === key);
+  if (!ref || !hit) fail(`${ref ? `unknown app "${ref}"` : 'which app?'} (have: ${Object.keys(apps).join(', ') || 'none'}; apps live in MobileApps/CUSTOMIZED/<APP>)`);
+  return hit;
 }

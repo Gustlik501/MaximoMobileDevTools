@@ -12,11 +12,9 @@ Never upload debug builds (mdt refuses).
 
 ## Checklist
 
-1. Framework: `mdt framework status` shows "patches/framework.patch is up to date"
-   (`mdt framework save` otherwise), and the patch is committed. `mdt package`
-   refuses unsaved edits so the release is reproducible.
-2. App sources committed in their own repo. `release.json` records the commit and
-   whether the tree was dirty.
+1. `mdt status`: no pending upgrade, no conflict markers (build refuses otherwise).
+2. Framework/CUSTOMIZED and MobileApps/CUSTOMIZED committed. `release.json` records the
+   commit and whether those trees were dirty; mdt warns when they are.
 3. `mdt package <app>` creates a release build in `dist/<app>/<version>-<time>/`.
 4. Test that exact build: `mdt push <app> --release` (writes to the device: only if
    the user wants a device test).
@@ -34,8 +32,7 @@ Never upload debug builds (mdt refuses).
 | `<app>__ver-<version>.zip` | app binary (Vite build + app-source.zip, framework compiled in). This is what `mdt upload` sends |
 | `<app>.zip` | sources in the MAS Configuration app's upload layout (`<app>/...`). Uploaded there, the **pod rebuilds with its own framework**: framework edits are lost unless the pod runs a patched image |
 | `app-source.zip` | raw project archive, same as inside the binary |
-| `release.json` | app/version, profile + image id, tool versions, framework files + patch sha, git commit, sha256 of every artifact |
-| `framework.patch` | copy of the patch the release was built with (if any) |
+| `release.json` | app/version, image id + OOTB versions, customized framework files, git commit + dirty flag, sha256 of every artifact |
 
 `<version>` is the raw app.xml `version` attribute (e.g. `9.2.71.0`), as IBM's
 tooling uses. Re-uploading the same version is fine: Maximo keeps a revision per
@@ -61,15 +58,13 @@ Needed only when people also publish from the MAS Configuration app: that pod
 builds with the image's framework.
 
 ```
-mdt framework save
-mdt image build --save        # FROM the IBM image + compiled overlay; verifies every patched file by sha256
+mdt image build --save        # FROM the IBM image + Framework/CUSTOMIZED's changes, compiled; verified by sha256
 ```
 
 Result: tag `localhost/mdt/graphite-configuration:<version>-mdt.<time>`, a
-docker-archive tar in `dist/images/`, the build context in
-`.mdt/image-build/<profile>/` (Containerfile, CHANGES.txt, framework.patch).
-Pushing it to a registry and changing the cluster is the user's call and isn't
-done by mdt: MAS pins the image by digest and the operator reconciles the
-deployment, so it needs the override mechanism of their MAS version. IBM support
-doesn't cover a modified framework. After every Maximo update: new tar, `mdt init`,
-resolve rejects, `mdt framework save`, `mdt image build` again.
+docker-archive tar in `dist/images/`, the build context in `.mdt/image-build/`
+(Containerfile, CHANGES.txt). Pushing it to a registry and changing the cluster is the
+user's call and isn't done by mdt: MAS pins the image by digest and the operator
+reconciles the deployment, so it needs the override mechanism of their MAS version.
+IBM support doesn't cover a modified framework. After every Maximo update: the
+`mdt-upgrade` skill, then `mdt image build` again on the new image.

@@ -6,7 +6,7 @@
 # maxdev-cli package-app -v <app.xml version>, plus an optional framework overlay.
 #
 # Mounts: /src (app sources, ro)  /mdt (tool, ro)  /out (results, rw)
-#         /framework + /baseline (optional, ro)
+#         /framework = Framework/CUSTOMIZED, /ootb = Framework/OOTB (optional, ro)
 # Env:    MDT_DEBUG=1      unminified bundle + external source maps
 #         MDT_FRAMEWORK=0  build with the stock framework from the image
 #         VITE_*           passed through into the app's process.env
@@ -28,8 +28,8 @@ mkdir -p "$W"
 rm -rf /out/www /out/generated /out/*.zip /out/framework-report.json /out/mdt-build.json
 tar -C /src --exclude=./.git --exclude=./build --exclude=./node_modules --exclude=./coverage -cf - . | tar -C "$W" -xf -
 
-if [ "${MDT_FRAMEWORK:-1}" = "1" ] && [ -f /baseline/manifest.json ] && [ -d /framework ]; then
-  node /mdt/container/compile-framework.cjs --framework /framework --baseline /baseline --apply --report /out/framework-report.json
+if [ "${MDT_FRAMEWORK:-1}" = "1" ] && [ -d /framework ] && [ -d /ootb ]; then
+  node /mdt/container/compile-framework.cjs --framework /framework --ootb /ootb --apply --report /out/framework-report.json
 else
   log "framework overlay: off (stock framework from the image)"
 fi
@@ -56,7 +56,15 @@ if [ "${MDT_DEBUG:-0}" != "1" ]; then
   export CI=true GRAPHITE_RELEASE=true
 fi
 log "maxdev-cli build"
-npx --no-install maxdev-cli build --in ./src/app.xml --out ./build/app/src/ --update-ids --copy
+if ! npx --no-install maxdev-cli build --in ./src/app.xml --out ./build/app/src/ --update-ids --copy; then
+  if [ -s /out/framework-report.json ] && grep -q '"[A-Za-z]' /out/framework-report.json; then
+    log "hint: maxdev-cli loads maximo-js-api in Node (build/commonjs) while generating the app, and your"
+    log "      framework edits are compiled into it. Module-level window/document access breaks that"
+    log "      (often reported as 'No Transformer for ...'): guard it with typeof window !== 'undefined'."
+    log "      Check: mdt build <app> --no-framework"
+  fi
+  exit 1
+fi
 
 if [ "${MDT_DEBUG:-0}" = "1" ]; then
   # the React code app.xml turned into: shows which framework components/props each tag uses

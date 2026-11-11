@@ -134,14 +134,40 @@ interoperate with IBM's ES5 classes).
   containing `<app>/...` (the project). It replaces files in its workspace copy; the
   pod then builds with **its** framework.
 
+## Upgrades: OOTB / CUSTOMIZED merge
+
+- `mdt upgrade` merges per file with base = `git show <base>:<OOTB path>` (default HEAD),
+  theirs = OOTB in the working tree, ours = CUSTOMIZED, using
+  `git merge-file -p --diff3`. Text is compared and merged with CRLF normalized to LF.
+  An OOTB tree with no files at the base counts as a first import, not an upgrade.
+- IBM's XML merge engine is in the image:
+  `/graphite/graphite-app-diff-tools/bin/graphite-app-diff-tools diff -b<orig> -m<modified> -t<delta>`
+  and `apply -t<delta> -i<new base> -o<out> -f` (Java; `graphite-tools.js diff|apply`
+  wraps it; `*.delta.xml` in Configuration-app sources come from it). It works per Graphite
+  element/attribute. Round trip on TECHMOBILE's app.xml (IBM base -> customized ->
+  re-applied) is semantically identical (4614 elements), but it drops XML comments
+  here and there and **rewrites attribute order and formatting** (about 4,000 of 6,555
+  lines differ textually). So mdt uses it only as a second opinion for conflicting XML.
+  In a test, it correctly combined an IBM attribute and a customer attribute added to
+  the same element, where the text merge conflicted.
+- Guards: `mdt build` refuses while OOTB differs from HEAD without a recorded merge
+  (`.mdt/upgrade/state.json` holds a hash of the merged OOTB), and while
+  `<<<<<<<`/`>>>>>>>` markers exist in CUSTOMIZED.
+- maxdev-cli loads `@maximo/maximo-js-api` in Node (`build/commonjs`) while generating the
+  app, and mdt compiles customized framework files into that build too. Module-level
+  `window` access throws there, and the failure surfaces as
+  `No Transformer for maximo-datasource` (the transformer's import chain fails).
+
 ## Gotchas
 
 - Windows bind mounts reject chmod/utime: unzip inside the container, then `cp`.
 - Git Bash rewrites `/paths` passed to native tools (MSYS); mdt spawns podman
   directly from Node. GNU tar from Git Bash can't open `C:\` paths; use
   `%SystemRoot%\System32\tar.exe`.
-- `git apply` follows `core.autocrlf=true` and would turn IBM's LF files into CRLF;
-  mdt passes `-c core.autocrlf=false -c core.eol=lf`.
+- Line endings: `.gitattributes` keeps everything LF in the repo; mdt normalizes CRLF
+  when importing OOTB apps and when comparing/merging, so a CRLF checkout of a file
+  doesn't count as a customization. On Windows, git ignores letter case: an ignore
+  rule `framework/` also hides `Framework/`.
 - Debug bundles are about 45 MB of JS + a 105 MB map. Fine for adb, too big to publish.
 - MAS references the graphite-configuration image by digest and the operator
   reconciles its deployment. Running a patched image needs an override mechanism on
