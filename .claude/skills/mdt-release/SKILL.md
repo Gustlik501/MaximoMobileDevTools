@@ -5,8 +5,9 @@ description: Ship a Maximo Mobile app built with mdt - package a release (app bi
 
 # Releasing
 
-**Uploads change a shared server: only when the user asks, always `--dry-run`
-first, and name the target environment back to the user before the real upload.**
+**Uploads change a shared server.** `mdt policy` → `uploads`: `never` = don't,
+tell the user the command to run themselves; `ask` = only when the user asked for
+it, always `--dry-run` first, and name the target environment before the real upload.
 Never upload debug builds (mdt refuses).
 
 ## Checklist

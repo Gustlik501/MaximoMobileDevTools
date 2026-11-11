@@ -34,6 +34,16 @@ else
   log "framework overlay: off (stock framework from the image)"
 fi
 
+if [ "${MDT_DEBUG:-0}" = "1" ] && [ "${MDT_TEST_HOOK:-1}" = "1" ]; then
+  # window.__mdt.app for `mdt state` / `mdt eval` (debug builds only, throwaway container)
+  AS=/graphite/node_modules/@maximo/maximo-js-api/build/ejs/app/AppSwitcher.js
+  if grep -q "AppSwitcher = new Factory" "$AS"; then
+    tr -d '\r' < /mdt/container/test-hook.js >> "$AS" && log "test hook: window.__mdt.app"
+  else
+    log "test hook skipped: AppSwitcher.js has an unexpected shape"
+  fi
+fi
+
 cd "$W"
 if node -e 'process.exit(require("./package.json").scripts?.labels ? 0 : 1)' 2>/dev/null; then
   log "labels"
@@ -87,6 +97,7 @@ try { fw = JSON.parse(fs.readFileSync("/out/framework-report.json", "utf8")); } 
 fs.writeFileSync("/out/mdt-build.json", JSON.stringify({
   appId: process.argv[1], version: process.argv[2], zip: require("path").basename(process.argv[3]),
   buildJsonVersion: b.version, debug: process.env.MDT_DEBUG === "1", builtAt: new Date().toISOString(),
+  testHook: process.env.MDT_DEBUG === "1" && process.env.MDT_TEST_HOOK !== "0",
   appProcessorVersion: b.appProcessorVersion, buildToolsVersion: b.buildToolsVersion,
   framework: fw ? {changed: fw.changed, added: fw.added} : null
 }, null, 1));

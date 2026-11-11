@@ -33,6 +33,13 @@ framework/<profile>/react-components/   ui/<Component>/ (Button, Card, Dialog, T
 - The framework runs inside each app bundle on the device. Debug it with a
   `--debug` build + `chrome://inspect` (see the `mdt-device` skill).
 
+## Permission
+
+`mdt policy` → `framework`: `read-only` = don't edit, show the change as a diff
+the user can apply; `ask` = the user approves each edit (Claude Code prompts); `auto` =
+edit, then report. Before the first framework edit in a conversation, say which files
+you'll change and why; framework changes ship with every app.
+
 ## Editing rules
 
 - Edit files in place under `framework/<profile>/<package>/`. Keep IBM's
@@ -53,8 +60,8 @@ mdt build <app> --debug              # compile errors appear as [framework] ERRO
 ```
 
 To prove an edit landed, search the bundle for a string you added:
-`out/<profile>/<app>/www/assets/index-*.js`. Testing on the device writes to it:
-only `mdt deploy <app> --debug` when the user asked.
+`out/<profile>/<app>/www/assets/index-*.js`. To see it work, test on the device
+with the `mdt-test` skill (`mdt deploy <app> --debug`, within the `device` / `device-ui` policy).
 
 ## Keep the change
 

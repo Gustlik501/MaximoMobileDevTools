@@ -60,6 +60,59 @@ Debugging: open `chrome://inspect` in Chrome on the PC, then click **inspect**
 under *Navigator*. The app runs in the `navigator_Iframe` frame; with `--debug`
 you get source maps, and edited framework files show as `framework/<pkg>/<file>`.
 
+## Driving the app (you or an agent)
+
+mdt can operate the app on the device through the WebView's DevTools connection,
+so an agent can make a change, push it and check the result itself:
+
+```powershell
+mdt ui                          # visible controls as [ref] "label" #id (in: card text) + page text
+mdt tap 4                       # or tap "Razširi" | --id "cardtemplate1[9]_chevron" | --selector css
+mdt type 7 "pump" --enter       # key back | wake | enter | escape ...    scroll down
+mdt wait "Delovni nalog"        # until text (or --selector) shows up, --gone for the reverse
+mdt state                       # current page, page stack, datasources (debug builds)
+mdt console --errors            # JS errors, including ones logged before attaching
+mdt screenshot                  # PNG (screen must be on)
+```
+
+Debug builds get a small test hook in the build container (`window.__mdt.app` =
+the running Application), which `mdt state` and `mdt eval` use. Release builds don't.
+
+## Agent permissions
+
+You decide what an agent may do. The block in **AGENTS.md** holds the defaults; your
+own per-clone choice goes in **AGENTS.local.md** (git-ignored), most easily with:
+
+```powershell
+mdt policy                                        # show the effective policy
+mdt policy set device=auto device-ui=auto         # let the agent push and click through tests
+mdt policy set framework=read-only uploads=never  # framework only as suggestions, never upload
+```
+
+| key | levels | covers |
+|---|---|---|
+| `device` | off / read-only / **ask** / auto | push, deploy, restore, reload, restart |
+| `device-ui` | off / read-only / **ask** / auto | tap, type, key, eval |
+| `device-data` | **ask** / auto | saving, submitting, syncing records while testing |
+| `framework` | read-only / **ask** / auto | edits under `framework/` |
+| `apps` | read-only / ask / **auto** | edits under `apps/` |
+| `uploads` | never / **ask** | upload, publish, image pushes |
+
+`ask` means an approval prompt for every such action. In Claude Code this is enforced
+by a PreToolUse hook (`mdt/agent/policy-hook.mjs`): `ask` makes Claude Code prompt
+you even in auto mode, and `off`/`read-only`/`never` block the call. mdt also refuses
+blocked actions when it runs non-interactively, which covers other agents too. In
+your own terminal mdt never stops you.
+
+**Install the hook once** (Claude Code won't let an agent install hooks itself):
+
+```powershell
+copy mdt\agent\claude-settings.json .claude\settings.json
+git add .claude/settings.json; git commit -m "Enable the mdt agent policy hook"
+```
+
+`mdt doctor` / `mdt policy` warn while it's missing; `/hooks` in Claude Code shows it.
+
 ## Changing the framework
 
 1. Edit files under `framework/<profile>/maximo-js-api/` or `.../react-components/`
@@ -124,7 +177,8 @@ updated" steps plus a new `image build`.
 ## Layout
 
 ```
-mdt/                tool (mdt.mjs CLI, lib/, container/ scripts that run inside the IBM image)
+AGENTS.md           agent rules + default permission policy (AGENTS.local.md: per clone, ignored)
+mdt/                tool (mdt.mjs CLI, lib/, container/ scripts for the IBM image, agent/ policy hook)
 docs/internals.md   how the image, the build, the device and the upload work
 patches/            framework.patch: your framework edits (tracked)
 targets/            upload targets (only example.json tracked)
@@ -135,9 +189,10 @@ out/ dist/ .mdt/    builds, releases, baselines, device backups (ignored)
 mdt.json            this clone's state (ignored, rebuilt by init)
 ```
 
-## With Claude Code
+## With Claude Code (or another agent)
 
-Open the clone in Claude Code. `CLAUDE.md` and the skills in `.claude/skills/`
-(`mdt-setup`, `mdt-framework`, `mdt-device`, `mdt-release`) explain the workflow, so
-you can ask things like "set this environment up", "make the WO list show X, it's
-in the framework" or "package techmobile for UAT".
+Open the clone in Claude Code. `AGENTS.md` (rules + permission policy, read by most
+coding agents), `CLAUDE.md` and the skills in `.claude/skills/` (`mdt-setup`,
+`mdt-framework`, `mdt-device`, `mdt-test`, `mdt-release`) explain the workflow, so
+you can ask things like "set this environment up", "the WO list should show the
+asset description, change it and test it on the tablet" or "package techmobile for UAT".

@@ -257,6 +257,7 @@ export function printDevice(dev) {
   console.log(`${dev.pkg} ${ver} ${dbg ? 'DEBUGGABLE' : 'not debuggable'}`);
   const sock = dev.devtoolsSocket();
   console.log(`WebView DevTools: ${sock || 'app not running'}`);
+  console.log(`screen: ${(dev.shell('dumpsys power', {allowFail: true}).match(/mWakefulness=(\w+)/) || [])[1] || '?'}`);
   for (const appId of dev.listApps()) {
     const b = dev.readBuildJson(appId);
     console.log(`  ${appId.padEnd(14)} ${String(b?.version || '?').padEnd(10)} app-processor ${b?.appProcessorVersion || '?'}`);

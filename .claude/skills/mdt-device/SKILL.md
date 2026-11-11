@@ -5,11 +5,13 @@ description: Build a Maximo Mobile app with mdt and test it on an Android device
 
 # Building and testing on a device
 
-**The device is read-only unless the user asks for a change on it.** Read-only:
-`mdt device`, `mdt backup <app>`, `mdt app import <app>`, `mdt env detect`,
-`mdt push <app> --dry-run`. These write to the device: `push`, `deploy`,
-`restore`, `reload` (reloads the app, unsaved form data is lost), `--restart`
-(kills the app). Run them only when the user asked in this conversation.
+**What you may do on the device is set by `mdt policy`** (AGENTS.md, AGENTS.local.md).
+Under `device`: read-only commands are `mdt device`, `backup`, `app import`,
+`env detect`, `push --dry-run`; device changes are `push`, `deploy`, `restore`,
+`reload` (unsaved form data in the app is lost) and `--restart` (kills the app).
+`off` = no device access, `read-only` = reads only, `ask` = the user approves each
+change (Claude Code prompts via the policy hook), `auto` = go ahead and report.
+Driving the UI (tap/type) is `device-ui` and has its own skill, `mdt-test`.
 
 ## Loop
 

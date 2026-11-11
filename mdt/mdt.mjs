@@ -12,6 +12,8 @@ import * as fw from './lib/framework.mjs';
 import {checkEngine, containerRun, containerScript, engine, engineStatus, imageExists, imageIdFromTar, inspectImage, loadImage} from './lib/container.mjs';
 import {Device, backup, detectAdb, detectBuildEnv, printDevice, pushBundle, reload, restoreBackup} from './lib/device.mjs';
 import {describeTarget, loadTarget, uploadZip} from './lib/upload.mjs';
+import * as drive from './lib/drive.mjs';
+import {LEVELS, POLICY_FILES, classifyMdt, decide, loadPolicy, writeLocalPolicy} from './lib/policy.mjs';
 import {
   APP_ID_RE,
   DEFAULT_PACKAGES,
@@ -66,6 +68,7 @@ function doctor(cfg, {quiet = false} = {}) {
     const devs = dev.devices();
     add('device', devs.length > 0, devs.length ? devs.join(', ') : 'none connected');
   }
+  add('policy', hookInstalled(), hookInstalled() ? 'Claude Code hook installed' : HOOK_HINT);
   if (!quiet) for (const r of rows) console.log(`  ${r.good ? c.green('ok ') : c.yellow('-- ')} ${r.name.padEnd(7)} ${r.detail}`);
   if (major < 22) fail('Node 22 or newer is required');
   return {rows, adb, engineOk: es.ok};
@@ -466,7 +469,13 @@ function buildApp(cfg, appRef, opt) {
   // VITE_ROUTING_MODE, VITE_MAS_DOMAIN, VITE_ROOT_PATH (mdt env detect copies them)
   const env = Object.fromEntries(Object.entries({...cfg.buildEnv, ...(prof.buildEnv || {})}).filter(([k]) => /^(VITE_|REACT_APP_|GRAPHITE_)/.test(k)));
   const t0 = Date.now();
-  const r = containerRun(cfg, prof.image, mounts, {...env, MDT_DEBUG: opt.debug ? '1' : '0', MDT_FRAMEWORK: useFw ? '1' : '0'}, containerScript('build-app.sh'));
+  const r = containerRun(
+    cfg,
+    prof.image,
+    mounts,
+    {...env, MDT_DEBUG: opt.debug ? '1' : '0', MDT_FRAMEWORK: useFw ? '1' : '0', MDT_TEST_HOOK: opt['no-test-hook'] ? '0' : '1'},
+    containerScript('build-app.sh')
+  );
   if (r.status !== 0) fail(`build failed (exit ${r.status})`);
   const meta = readJson(path.join(out, 'mdt-build.json'));
   if (!meta) fail('build finished without mdt-build.json');
@@ -599,9 +608,97 @@ async function cmdRestore(cfg, appRef, file, opt) {
   if (!opt['no-reload']) await reload(dev, appId, {restart: !!opt.restart});
 }
 
+// ================================================================ agent policy
+
+function cmdPolicy(cfg, {pos}) {
+  if (pos[0] === 'set') {
+    const changes = {};
+    for (const kv of pos.slice(1)) {
+      const [k, v] = kv.split('=');
+      if (!LEVELS[k]) fail(`unknown policy key ${k} (keys: ${Object.keys(LEVELS).join(', ')})`);
+      if (!LEVELS[k].includes(v)) fail(`${k} must be one of: ${LEVELS[k].join(' | ')}`);
+      changes[k] = v;
+    }
+    if (!Object.keys(changes).length) fail('usage: mdt policy set device=auto device-ui=ask framework=read-only ...');
+    writeLocalPolicy(changes);
+    ok(`wrote ${rel(POLICY_FILES[1])}`);
+  }
+  const {policy, sources} = loadPolicy();
+  console.log(c.bold('agent policy') + c.dim('  (AGENTS.md, overridden by AGENTS.local.md)'));
+  for (const [k, v] of Object.entries(policy)) {
+    console.log(`  ${k.padEnd(12)} ${v.padEnd(10)} ${c.dim(`${sources[k]}   options: ${LEVELS[k].join(' | ')}`)}`);
+  }
+  console.log(hookInstalled() ? c.dim('  Claude Code hook: installed (.claude/settings.json)') : c.yellow(`  ${HOOK_HINT}`));
+}
+
+const HOOK_HINT = 'Claude Code hook NOT installed: copy mdt/agent/claude-settings.json to .claude/settings.json (then commit it)';
+function hookInstalled() {
+  const f = path.join(ROOT, '.claude', 'settings.json');
+  return fs.existsSync(f) && fs.readFileSync(f, 'utf8').includes('policy-hook.mjs');
+}
+
+// Refuse blocked actions for non-interactive callers (agents). People in a
+// terminal are not stopped; the Claude Code hook also asks for "ask" levels.
+function enforcePolicy(argv) {
+  const cls = classifyMdt(argv.filter(a => !a.startsWith('--') || a === '--dry-run' || a === '--reload'));
+  if (!cls) return;
+  const d = decide(loadPolicy().policy, cls);
+  if (d.decision === 'deny' && !process.stdin.isTTY && !process.env.MDT_POLICY_OVERRIDE) {
+    fail(`blocked by agent policy (${d.key}: ${d.level}). Change it with \`mdt policy set ${d.key}=...\` in your own terminal, or edit AGENTS.local.md.`);
+  }
+}
+
+// ================================================================ driving the app
+
+async function cmdDrive(cfg, cmd, rest, opt) {
+  const dev = new Device(cfg, opt).ensure();
+  const app = opt.app || 'current';
+  switch (cmd) {
+    case 'ui': {
+      const u = await drive.uiDump(dev, {app, all: !!opt.all, textLimit: Number(opt['text-limit'] || 2500)});
+      return console.log(opt.json ? JSON.stringify(u, null, 1) : drive.formatUi(u));
+    }
+    case 'tap':
+      return drive.tap(dev, rest[0], opt);
+    case 'type':
+      return drive.type(dev, rest[0], rest[1], opt);
+    case 'key':
+      return drive.key(dev, rest[0] || '');
+    case 'scroll':
+      return drive.scroll(dev, rest[0] || 'down', opt);
+    case 'wait':
+      if (!rest[0] && !opt.selector) fail('usage: mdt wait "<text>" | --selector <css>  [--timeout 20] [--gone]');
+      return drive.waitFor(dev, rest[0], opt);
+    case 'eval': {
+      if (!rest[0]) fail('usage: mdt eval "<js expression>" [--app <id>|navigator]');
+      return console.log(JSON.stringify(await drive.evalJs(dev, rest[0], {app}), null, 1));
+    }
+    case 'state': {
+      const st = await drive.appState(dev, {app});
+      if (st?.error) fail(st.error);
+      if (!st.hook) return warn(`${st.app}: no test hook. It exists in mdt debug builds only: mdt deploy ${st.app} --debug`);
+      return console.log(JSON.stringify(st, null, 1));
+    }
+    case 'console': {
+      const before = opt.reload ? async () => reload(dev, String(opt.app || rest[0] || 'navigator').toLowerCase()) : null;
+      const msgs = await drive.consoleLog(dev, opt, before);
+      if (opt.json) return console.log(JSON.stringify(msgs, null, 1));
+      for (const m of msgs.slice(-Number(opt.limit || 200))) console.log(`${m.level.padEnd(9)} ${m.text.slice(0, 500)}${m.at ? c.dim(`  @${m.at}`) : ''}`);
+      return info(`${msgs.length} message(s)${opt.errors ? ' (errors/warnings only)' : ''}`);
+    }
+    case 'screenshot': {
+      const out = opt.out ? path.resolve(opt.out) : undefined;
+      const f = opt.webview ? await drive.webviewScreenshot(dev, out) : drive.screenshot(dev, out);
+      return console.log(f);
+    }
+    case 'logcat':
+      return console.log(drive.logcat(dev, opt));
+  }
+}
+
 // ================================================================ main
 
-const HELP = `mdt - Maximo Mobile dev toolkit   (workspace ${ROOT})
+const HELP =`mdt - Maximo Mobile dev toolkit   (workspace ${ROOT})
 
 setup
   init                        set up / refresh: images/*.tar -> profiles, apps/* -> apps, device env
@@ -627,6 +724,21 @@ build & device   (device commands need a debuggable Maximo Mobile APK)
   reload [app] [--restart]    reload the app in Navigator, or restart the APK
   restore <app> [backup.tar]  default: oldest backup
 
+drive & test the app on the device   (target = visible app; --app <id>|navigator)
+  ui [--all] [--json]         visible controls as [ref] lines + page text
+  tap <ref|"text"> | --selector css | --xy x,y [--nth N] [--js]
+  type <ref|"text"> "value" [--clear] [--enter]
+  key back|enter|tab|escape|backspace|arrowdown|arrowup
+  scroll [down|up|<ref>]      wait "<text>" | --selector css [--timeout 20] [--gone]
+  state                       page, page stack, datasource counts (debug builds)
+  eval "<js>"                 run JS in the app window, print the result
+  console [--seconds 3] [--errors] [--reload]     logcat [--lines 200] [--grep re]
+  screenshot [--webview] [--out f.png]
+
+agent policy   (AGENTS.md defaults, AGENTS.local.md per clone; enforced by the Claude Code hook)
+  policy                      show the effective policy
+  policy set device=auto device-ui=ask framework=read-only apps=auto uploads=never ...
+
 release
   package <app>               release build -> dist/<app>/<version>-<time>/ (binary, source zips, release.json)
   upload <app> --target T [--release dir] [--dry-run] [--yes]   send the packaged binary to Maximo
@@ -636,7 +748,10 @@ release
 options: --profile <name> (default: active)  --serial <adb serial>
 `;
 
-const VALUE_OPTS = new Set(['profile', 'packages', 'name', 'id', 'tag', 'save', 'out', 'target', 'release', 'serial', 'as', 'to']);
+const VALUE_OPTS = new Set([
+  'profile', 'packages', 'name', 'id', 'tag', 'save', 'out', 'target', 'release', 'serial', 'as', 'to',
+  'app', 'selector', 'text', 'nth', 'xy', 'seconds', 'timeout', 'lines', 'grep', 'limit', 'text-limit'
+]);
 
 function parseArgs(argv) {
   const pos = [];
@@ -658,7 +773,22 @@ async function main() {
   const [cmd, ...rest] = pos;
   const cfg = loadCfg();
   const a = {pos: rest, opt};
+  enforcePolicy(process.argv.slice(2));
   switch (cmd) {
+    case 'policy':
+      return cmdPolicy(cfg, a);
+    case 'ui':
+    case 'tap':
+    case 'type':
+    case 'key':
+    case 'scroll':
+    case 'wait':
+    case 'eval':
+    case 'state':
+    case 'console':
+    case 'screenshot':
+    case 'logcat':
+      return cmdDrive(cfg, cmd, rest, opt);
     case 'init':
       return cmdInit(cfg, a);
     case 'doctor':

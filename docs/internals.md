@@ -99,6 +99,27 @@ interoperate with IBM's ES5 classes).
   (`preview-middleware.js`) still expects the old CRA layout and isn't wired into
   graphite-cli 4. mdt uses run-as instead.
 
+## Driving the app (mdt ui / tap / type / state)
+
+- mdt forwards `webview_devtools_remote_<pid>` to a local port, picks the Navigator
+  page target and evaluates JS there. The app document is reached through
+  `#navigator_Iframe`'s `contentDocument` (same origin). Clicks are CDP
+  `Input.dispatchMouseEvent` at the element's centre (iframe offset added), text
+  goes in via `Input.insertText`, Android back/wake via `adb shell input keyevent`.
+- Graphite renders app.xml ids as DOM ids (`cardtemplate1[9]_chevron`,
+  `<ds>_searchbuttongroup_...`): stable targets. Button text often sits in a
+  non-standard `label=""` attribute; icons are `<svg aria-label>` or class
+  `Carbon:<name>`. WO cards are `role=tabpanel` elements whose id is the WO id.
+- The app instance isn't global (`appContext.currentApp` is never set in 3.2.825).
+  `AppSwitcher.get().currentApp` holds it; debug builds append
+  `mdt/container/test-hook.js` to the compiled `app/AppSwitcher.js` in the build
+  container, which exposes it as `window.__mdt.app` (`currentPage`, `findDatasource()`,
+  `datasource.state.{itemCount,totalCount,loading,error}`).
+- `Runtime.enable` replays earlier console messages, so `mdt console` also shows
+  errors from app start.
+- `screencap` is black while the screen is off (`dumpsys power` → `mWakefulness`),
+  and `Page.captureScreenshot` hangs then. DOM, state and console work regardless.
+
 ## Upload endpoints (maxdev-cli upload-app)
 
 - API key / user+password (Manage >= 7.6.1.3): `PUT
