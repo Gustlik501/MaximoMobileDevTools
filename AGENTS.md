@@ -57,7 +57,9 @@ server (UAT or prod data).
   scrolling and filling a form without saving are fine under `device-ui`.
 - Never: uninstall the app, clear its data (`pm clear`), log out, delete the offline
   database, change device settings. Unsynced offline transactions would be lost.
-- Use mdt for device work, not raw `adb` (raw adb writes always need approval).
+- Prefer mdt for device work. Raw `adb` follows the same keys as mdt (reads:
+  `device`, `shell input`: `device-ui`, anything else: `device`); uninstall, `pm clear`,
+  `rm`, `settings put` and reboot always need approval.
 - `mdt push` backs up first; `mdt restore <app>` puts the server version back.
   Tell the user when the device runs a pushed (non-server) build.
 

@@ -140,7 +140,7 @@ export function decide(policy, cls) {
       const a = decide(policy, 'apps-write');
       return RANK[f.decision] >= RANK[a.decision] ? f : a;
     }
-    case 'adb-write':
+    case 'adb-risky':
       return how('device', {off: 'deny', 'read-only': 'deny', ask: 'ask', auto: 'ask'});
     case 'registry-push':
       return how('uploads', {never: 'deny', ask: 'ask'});
@@ -251,7 +251,30 @@ const SHELLS = new Set(['bash', 'sh', 'zsh', 'cmd', 'powershell', 'pwsh']);
 const SCRIPTS = new Set(['node', 'python', 'python3', 'py', 'perl', 'ruby', 'deno', 'bun']);
 const SCRIPT_WRITE = /writeFile|appendFile|rmSync|rmdirSync|unlinkSync|renameSync|cpSync|copyFileSync|mkdirSync|createWriteStream|open\([^)]*['"][wax+]|write_text|write_bytes|shutil\.|os\.(remove|rename|unlink|makedirs)|Set-Content|Out-File|Remove-Item|Copy-Item|Move-Item/;
 
-const ADB_READ = /^adb\s+(-s\s+\S+\s+)?(devices|version|get-state|get-serialno|logcat\s+-d|forward\s+--list|exec-out\s+screencap|shell\s+(getprop|dumpsys|pm\s+list|pidof|cat\s+\/proc|wm\s+size|ps))/i;
+// Raw adb is classified like the mdt command that does the same thing, so it follows
+// `device` / `device-ui`. Commands that can lose data (AGENTS.md "Never": uninstall,
+// clear app data, delete files, change settings) always ask.
+const ADB_READ = /^(devices|version|get-state|get-serialno|logcat\s+-d|forward\s+--list|exec-out\s+screencap|shell\s+(getprop|dumpsys|pm\s+list|pidof|cat\s+\/proc|wm\s+size|ps))\b/i;
+const ADB_UI = /^shell\s+input\s/i;
+const ADB_RISKY =
+  /^(uninstall|reboot|root|unroot|remount|disable-verity|enable-verity|sideload|(shell|exec-out)\s+(.*[\s;&|'"])?(pm\s+(clear|uninstall|disable|reset-permissions)|cmd\s+package\s+(clear|uninstall)|rm|rmdir|mv|settings\s+(put|delete|reset)|svc|reboot|wipe)\b)/i;
+// commands that only filter the output of a device command
+const READ_FILTERS = new Set([
+  'grep', 'egrep', 'fgrep', 'head', 'tail', 'sort', 'uniq', 'wc', 'cut', 'tr', 'findstr', 'select-string', 'sls', 'select-object',
+  'select', 'where-object', 'out-string', 'measure-object', 'format-table', 'ft', 'format-list', 'fl'
+]);
+
+/** Category of one raw adb call: args = everything after `adb`. */
+export function classifyAdb(args) {
+  const a = [...args];
+  // global options: -s/-t/-H/-P/-L take a value; -d/-e/-a don't
+  while (a.length && /^-[a-zA-Z]$/.test(a[0])) a.splice(0, /^-[stHPL]$/.test(a[0]) ? 2 : 1);
+  const rest = a.join(' ');
+  if (ADB_RISKY.test(rest)) return 'adb-risky';
+  if (ADB_READ.test(rest) && !/[;&|`$<>]/.test(rest)) return 'device-read';
+  if (ADB_UI.test(rest)) return 'device-ui';
+  return 'device-write';
+}
 
 const cmdName = t => path.basename(String(t).replace(/\\/g, '/')).toLowerCase().replace(/\.exe$/, '');
 const isStr = t => typeof t === 'string';
@@ -339,7 +362,7 @@ export function classifyCommand(cmdline, cwd = ROOT, depth = 0) {
       continue;
     }
     if (seg.cmd === 'adb') {
-      if (!ADB_READ.test(`adb ${seg.args.join(' ')}`)) classes.add('adb-write');
+      classes.add(classifyAdb(seg.args));
       continue;
     }
     if (['podman', 'docker', 'skopeo'].includes(seg.cmd) && ['push', 'copy'].includes(seg.args.find(a => !a.startsWith('-')))) {
@@ -361,9 +384,14 @@ export function classifyCommand(cmdline, cwd = ROOT, depth = 0) {
     else for (const p of w) if (p) addPath(p);
   }
   for (const s of subs) if (depth < 3) for (const c of classifyCommand(s, dir, depth + 1).classes) classes.add(c);
-  const only = segs.length === 1 ? commandOf(segs[0]) : null;
-  const simpleMdt = !!only && !!mdtArgsOf(only) && !only.redirects.length && !subs.length;
-  return {classes: [...classes], simpleMdt};
+  // simple: mdt/adb calls, cd, and filters of their output; no file redirects, no $(...)
+  const parsed = segs.map(commandOf);
+  const isDeviceCall = s => !!mdtArgsOf(s) || s.cmd === 'adb';
+  const simple =
+    !subs.length &&
+    parsed.some(isDeviceCall) &&
+    parsed.every(s => (isDeviceCall(s) || CD.has(s.cmd) || READ_FILTERS.has(s.cmd)) && s.redirects.every(r => NULL_TARGETS.test(r)));
+  return {classes: [...classes], simple};
 }
 
 const RANK = {deny: 3, ask: 2, allow: 1};
@@ -380,7 +408,7 @@ export function decideToolCall(toolName, input, policy) {
   } else if (/^(Bash|PowerShell)$/.test(toolName)) {
     const r = classifyCommand(input.command || '', input.cwd || ROOT);
     classes = r.classes;
-    simple = r.simpleMdt;
+    simple = r.simple;
   }
   if (!classes.length) return null;
   let best = null;
@@ -390,13 +418,13 @@ export function decideToolCall(toolName, input, policy) {
     if (!best || RANK[d.decision] > RANK[best.decision]) best = {...d, cls};
   }
   if (!best) return null;
-  // only a single plain mdt call (or a direct file edit) may be auto-allowed
+  // only plain mdt/adb calls (or a direct file edit) may be auto-allowed
   if (best.decision === 'allow' && !simple) return null;
   const what = {
     'device-read': 'reading from the device',
     'device-write': 'installing/reloading on the device',
     'device-ui': 'driving the app UI on the device',
-    'adb-write': 'a raw adb command that may change the device (use mdt instead)',
+    'adb-risky': 'a raw adb command that can lose device data (uninstall, pm clear, rm, settings, reboot)',
     'framework-write': 'changing framework sources (Framework/CUSTOMIZED)',
     'apps-write': 'changing app sources (MobileApps/CUSTOMIZED)',
     'ootb-write': "changing IBM's pristine sources (OOTB: only via mdt ootb during an upgrade)",
