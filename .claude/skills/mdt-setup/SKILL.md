@@ -12,7 +12,8 @@ IBM code; a project repo does, so it must be private.
 ## Steps
 
 1. `.\mdt.cmd doctor` (Git Bash: `./mdt.sh doctor`). Needs Node >= 22, Podman, git,
-   curl; adb and a debuggable APK only for device work. The folder must be a git repo.
+   curl; a debuggable APK only for device work (adb ships in `mdt/platform-tools/`). The
+   folder must be a git repo.
 2. **Framework.** Copy the environment's `mas/graphite-configuration` tar into `images/`
    (`images/README.md` shows how to pull it), then run `mdt init`. It loads the image,
    extracts `Framework/OOTB` (sources rebuilt from the image's source maps), copies it to
@@ -43,7 +44,8 @@ No device? Set the build env by hand:
 | `no OOTB yet` | the tar isn't in `images/`, or isn't graphite-configuration |
 | `image ... is not loaded and no tar in images/ contains it` | the tar that `Framework/ootb.json` names is missing on this machine: copy it into `images/` |
 | `upgrade needs ... git repository` | `git init` + first commit |
-| adb not found | `"device": {"adb": "C:\\path\\adb.exe"}` in mdt.json, or put adb on PATH |
+| adb not found (macOS/Linux) | `mdt adb update` fetches Google's platform-tools adb for this system into `mdt/platform-tools/` |
+| use another adb (scrcpy, Android Studio) | `"device": {"adb": "C:\\path\\adb.exe"}` in mdt.json wins over the bundled one; `mdt adb` shows which one is used |
 | `run-as ... failed` | the APK must be a debuggable build |
 | several devices | `--serial <id>` |
 | app missing in `mdt status` | the folder needs `src/app.xml` (`<maximo-application id=...>` or `<application id=...>`) |

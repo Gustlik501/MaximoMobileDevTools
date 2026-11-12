@@ -34,8 +34,17 @@ identical files once, so CUSTOMIZED costs only the files you actually changed.
 ## Prerequisites
 
 Node 22+, git, curl (built into Windows 10+), **Podman** (Podman Desktop with a machine)
-or Docker (`"container": {"engine": "docker"}` in `mdt.json`). For device work: **adb**
-and a **debuggable** Maximo Mobile APK. `mdt doctor` checks all of it.
+or Docker (`"container": {"engine": "docker"}` in `mdt.json`). For device work: a
+**debuggable** Maximo Mobile APK. `mdt doctor` checks all of it.
+
+**adb ships with mdt**: Google's platform-tools adb for Windows, in `mdt/platform-tools/windows/`.
+`mdt adb update` replaces it with the newest stable release (checked against the SHA-1 in
+Google's SDK index); on macOS/Linux it fetches the adb for that system, `--os all` every
+platform. mdt uses `device.adb` from `mdt.json` if set, else the bundled adb, else an
+installed one (`mdt adb` shows which). One adb server serves the whole machine, and an adb
+client of a different version can restart it, which drops scrcpy's connection and port
+forwards. Use one adb for everything: start scrcpy with `ADB=<mdt's adb.exe>`, or point
+`device.adb` at scrcpy's adb.
 
 ## New project
 

@@ -3,14 +3,15 @@
  * mdt - Maximo Mobile dev toolkit. See README.md (usage) and docs/internals.md
  * (how the IBM image, the build and the device fit together).
  *
- * Requires Node >= 22, Podman (or Docker), git, curl; adb for device commands.
+ * Requires Node >= 22, Podman (or Docker), git, curl. adb ships in mdt/platform-tools (mdt adb update).
  */
 import fs from 'node:fs';
 import path from 'node:path';
 import {spawnSync} from 'node:child_process';
 import * as proj from './lib/project.mjs';
 import {containerRun, containerScript, engine, engineStatus} from './lib/container.mjs';
-import {Device, backup, detectAdb, detectBuildEnv, printDevice, pushBundle, reload, restoreBackup} from './lib/device.mjs';
+import {Device, backup, detectBuildEnv, printDevice, pushBundle, reload, restoreBackup} from './lib/device.mjs';
+import {BUNDLE, OSES, adbVersion, bundledAdb, bundledRevision, resolveAdb, updateAdb} from './lib/adb.mjs';
 import {describeTarget, loadTarget, uploadZip} from './lib/upload.mjs';
 import * as drive from './lib/drive.mjs';
 import {LEVELS, POLICY_FILES, classifyMdt, decide, loadPolicy, writeLocalPolicy} from './lib/policy.mjs';
@@ -66,8 +67,9 @@ function doctor(cfg, {quiet = false} = {}) {
   add('repo', proj.isGitRepo(), proj.isGitRepo() ? 'git repository' : 'not a git repository (upgrades need one: git init)');
   const curl = spawnSync(process.platform === 'win32' ? path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'curl.exe') : 'curl', ['--version'], {encoding: 'utf8'});
   add('curl', curl.status === 0, (curl.stdout || 'missing').split('\n')[0].trim());
-  const adb = (cfg.device.adb && fs.existsSync(cfg.device.adb) && cfg.device.adb) || detectAdb();
-  add('adb', !!adb, adb || 'not found (only needed for device commands)');
+  const found = resolveAdb(cfg);
+  const adb = found?.path || null;
+  add('adb', !!adb, adb ? `${adb} (${found.from}, ${adbVersion(adb) || 'does not run'})` : 'not found: mdt adb update (only needed for device commands)');
   if (adb) {
     const devs = new Device({...cfg, device: {...cfg.device, adb}}).devices();
     add('device', devs.length > 0, devs.length ? devs.join(', ') : 'none connected');
@@ -82,7 +84,6 @@ async function cmdInit(cfg, {opt}) {
   console.log(c.bold(`mdt project: ${ROOT}`));
   const d = doctor(cfg);
   for (const dir of [P.fwOotb, P.fwCust, P.appsOotb, P.appsCust, P.images, P.patches, P.targets, P.dist, P.state]) fs.mkdirSync(dir, {recursive: true});
-  if (d.adb) cfg.device.adb = d.adb;
 
   if (!d.engineOk) warn('container engine not ready: skipping the image');
   else if (!proj.fwMeta()) {
@@ -557,6 +558,20 @@ async function cmdDrive(cfg, cmd, rest, opt) {
   }
 }
 
+function cmdAdb(cfg, {pos, opt}) {
+  if (pos[0] === 'update') return void updateAdb(opt);
+  if (pos[0]) fail('usage: mdt adb [update [--os windows,linux,macosx|all] [--channel stable|beta|dev|canary] [--force]]');
+  const found = resolveAdb(cfg);
+  console.log(`  in use   ${found ? `${found.path}  (${found.from}, adb ${adbVersion(found.path) || 'does not run'})` : 'none: mdt adb update'}`);
+  for (const os of OSES) {
+    const v = bundledRevision(os);
+    if (v) console.log(`  bundled  ${os.padEnd(8)} platform-tools ${v}  ${rel(path.join(BUNDLE, os))}`);
+  }
+  if (found && found.from !== 'mdt/platform-tools' && bundledAdb()) {
+    info('mdt.json device.adb wins over the bundled adb: remove it to use mdt/platform-tools (one adb per machine at a time, see README)');
+  }
+}
+
 // ================================================================ main
 
 const HELP = `mdt - Maximo Mobile dev toolkit   (project ${ROOT})
@@ -569,6 +584,7 @@ setup
   init                        prerequisites, Framework/OOTB from images/*.tar, build env from the device
   doctor | status
   env | env detect [app] | env set VITE_X=... | env unset VITE_X
+  adb | adb update [--os windows,linux,macosx|all] [--channel beta]   Google's platform-tools in mdt/platform-tools
 
 OOTB, customizations, Maximo upgrades
   ootb framework [image.tar] [--packages a,b]     Framework/OOTB := sources from the image
@@ -608,7 +624,7 @@ options: --serial <adb serial>
 
 const VALUE_OPTS = new Set([
   'packages', 'name', 'tag', 'save', 'out', 'target', 'release', 'serial', 'as', 'to', 'base',
-  'app', 'selector', 'text', 'nth', 'xy', 'seconds', 'timeout', 'lines', 'grep', 'limit', 'text-limit', 'id'
+  'app', 'selector', 'text', 'nth', 'xy', 'seconds', 'timeout', 'lines', 'grep', 'limit', 'text-limit', 'id', 'os', 'channel'
 ]);
 
 function parseArgs(argv) {
@@ -641,6 +657,8 @@ async function main() {
       return cmdStatus(cfg);
     case 'env':
       return cmdEnv(cfg, a);
+    case 'adb':
+      return cmdAdb(cfg, a);
     case 'policy':
       return cmdPolicy(cfg, a);
     case 'ootb':

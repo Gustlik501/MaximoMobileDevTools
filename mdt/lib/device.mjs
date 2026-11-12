@@ -5,24 +5,11 @@ import net from 'node:net';
 import path from 'node:path';
 import {spawnSync} from 'node:child_process';
 import {APP_ID_RE, P, capture, fail, info, ok, rel, run, sha256File, stamp, warn} from './util.mjs';
-
-export function detectAdb() {
-  const which = spawnSync(process.platform === 'win32' ? 'where' : 'which', ['adb'], {encoding: 'utf8'});
-  if (which.status === 0) return which.stdout.split(/\r?\n/)[0].trim();
-  if (process.platform === 'win32') {
-    // the adb server is often already running from scrcpy or Android Studio
-    const ps = spawnSync('powershell', ['-NoProfile', '-Command', '(Get-Process adb -ErrorAction SilentlyContinue | Select-Object -First 1).Path'], {encoding: 'utf8'});
-    const p = (ps.stdout || '').trim();
-    if (p && fs.existsSync(p)) return p;
-    const sdk = path.join(process.env.LOCALAPPDATA || '', 'Android', 'Sdk', 'platform-tools', 'adb.exe');
-    if (fs.existsSync(sdk)) return sdk;
-  }
-  return null;
-}
+import {resolveAdb} from './adb.mjs';
 
 export class Device {
   constructor(cfg, opt = {}) {
-    this.adb = (cfg.device.adb && fs.existsSync(cfg.device.adb) && cfg.device.adb) || detectAdb() || 'adb';
+    this.adb = resolveAdb(cfg)?.path || 'adb';
     this.serial = opt.serial || cfg.device.serial || null;
     this.pkg = cfg.device.package || 'com.ibm.iot.maximo.mobile';
   }

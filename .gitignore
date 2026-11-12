@@ -18,5 +18,8 @@
 node_modules/
 /MobileApps/*/*/build/
 
+# a running adb server keeps the replaced adb.exe open: mdt adb update renames it aside
+/mdt/platform-tools/**/*.old
+
 .DS_Store
 Thumbs.db
